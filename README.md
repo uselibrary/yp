@@ -285,13 +285,6 @@ cargo build --target x86_64-apple-darwin --release
 - ✨ **功能**: 文件大小排序
 - 🔧 **编译**: 支持musl静态链接
 
-## 📝 许可证
-
-本项目使用 GPLv3 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
-
-## 🤝 贡献
-
-欢迎提交问题和拉取请求！
 
 ## 📊 性能基准
 
@@ -301,8 +294,13 @@ cargo build --target x86_64-apple-darwin --release
 | 中型项目 | ~1K文件 | ~50ms | ~5MB |
 | 大型项目 | ~10K文件 | ~200ms | ~15MB |
 
-*测试环境: Intel i7, SSD, Linux*
+> 测试环境: VPS E5V3, SSD, Linux
 
----
 
-⭐ 如果这个项目对你有帮助，请给个星标！
+## 📝 许可证
+
+本项目使用 GPLv3 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
+
+## 🤝 贡献
+
+欢迎提交问题和拉取请求！
