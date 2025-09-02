@@ -56,38 +56,38 @@ cargo build --target x86_64-unknown-linux-musl --release
 
 ```bash
 # 查看当前目录
-./yp
+yp
 
 # 查看指定目录
-./yp -p /path/to/directory
+yp -p /path/to/directory
 
 # 按大小排序显示
-./yp -s
+yp -s
 
 # 显示条形图
-./yp -c
+yp -c
 
 # 组合使用
-./yp -p /home -s -c
+yp -p /home -s -c
 
 # 简洁模式（只显示总大小）
-./yp -S
+yp -S
 ```
 
 ### 高级选项
 
 ```bash
 # 递归显示所有子目录
-./yp -r
+yp -r
 
 # JSON格式输出
-./yp -j
+yp -j
 
 # 简洁模式JSON输出
-./yp -S -j
+yp -S -j
 
 # 完整功能演示
-./yp -p /usr -s -c -r
+yp -p /usr -s -c -r
 ```
 
 ## 📋 命令行选项
