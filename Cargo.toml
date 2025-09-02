@@ -1,0 +1,12 @@
+[package]
+name = "yp"
+version = "0.1.2"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.5"
+colored = "3.0"
+terminal_size = "0.4"
