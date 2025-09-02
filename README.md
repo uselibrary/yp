@@ -21,8 +21,15 @@
 
 ## 📦 安装
 
-### 
+### 安装二进制文件
 
+从[发布页面](https://github.com/uselibrary/yp/releases)下载预编译的二进制文件，选择适合您系统的版本。当前仅提供`x86_64-unknown-linux-musl`版本。
+将下载的二进制文件放置到`/usr/local/bin`中，并赋予可执行权限。示例操作如下：
+```
+wget https://github.com/uselibrary/yp/releases/download/v0.1.2/yp-x86_64-unknown-linux-musl
+sudo mv yp-x86_64-unknown-linux-musl /usr/local/bin/yp
+sudo chmod +x /usr/local/bin/yp
+```
 
 ### 从源码编译
 
