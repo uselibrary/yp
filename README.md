@@ -26,7 +26,7 @@
 从[发布页面](https://github.com/uselibrary/yp/releases)下载预编译的二进制文件，选择适合您系统的版本。当前仅提供`x86_64-unknown-linux-musl`版本。
 将下载的二进制文件放置到`/usr/local/bin`中，并赋予可执行权限。示例操作如下：
 ```
-wget https://github.com/uselibrary/yp/releases/download/v0.1.2/yp-x86_64-unknown-linux-musl
+wget https://github.com/uselibrary/yp/releases/download/v0.1.3/yp-x86_64-unknown-linux-musl
 sudo mv yp-x86_64-unknown-linux-musl /usr/local/bin/yp
 sudo chmod +x /usr/local/bin/yp
 ```
@@ -35,14 +35,14 @@ sudo chmod +x /usr/local/bin/yp
 
 ```bash
 # 克隆仓库
-git clone <repository-url>
+git clone [<repository-url>](https://github.com/uselibrary/yp)
 cd yp
 
-# 普通编译
+# Linux 普通编译
 cargo build --release
 
 
-rustup target add x86_64-unknown-linux-musl # 静态链接编译
+rustup target add x86_64-unknown-linux-musl # Linux静态链接编译
 cargo build --target x86_64-unknown-linux-musl --release
 
 rustup target add x86_64-pc-windows-gnu # Windows编译
@@ -176,15 +176,7 @@ yp -p /usr -s -c -r
 - **信息保留**: 截断策略确保文件名的关键信息得以保留
 - **视觉提示**: 使用`...`清晰表示省略部分
 
-### 显示效果对比
-
-**处理前**（长文件名导致对齐混乱）:
-```
-📁 libserde-2b6650dbf0c6568b.rlib    5.57 MB [████████████████████████]
-📄 libserde-2b6650dbf0c6568b.rmeta   5.47 MB [████████████]  // 对齐混乱
-```
-
-**处理后**（完美对齐）:
+### 显示效果
 ```
 📄 libserde-2b6650dbf0c6568b.rlib                     5.57 MB [████████████████████████]
 📄 libserde-2b6650dbf0c6568b.rmeta                    5.47 MB [███████████████████████ ]
@@ -205,6 +197,7 @@ yp -p /usr -s -c -r
 - **serde_json**: JSON格式输出
 - **walkdir**: 目录遍历
 - **terminal_size**: 终端宽度检测
+- **unicode-width**: 计算字符串显示宽度
 
 ### 性能特点
 

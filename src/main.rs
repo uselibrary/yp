@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use terminal_size::{Width, terminal_size};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,7 +25,7 @@ struct DirReport {
 fn main() {
     let matches = Command::new("yp")
         .name("YP - 目录空间查看器")
-        .version("0.1.2")
+        .version("0.1.3")
         .author("Your Name")
         .about("一个功能强大的目录空间占用查看工具")
         .arg(
@@ -203,7 +204,9 @@ fn format_size(size: u64) -> String {
 }
 
 fn truncate_filename(name: &str, max_width: usize) -> String {
-    if name.chars().count() <= max_width {
+    let display_width = name.width();
+
+    if display_width <= max_width {
         name.to_string()
     } else if max_width <= 3 {
         "...".to_string()
@@ -217,20 +220,51 @@ fn truncate_filename(name: &str, max_width: usize) -> String {
             let start_chars = available / 2;
             let end_chars = available - start_chars;
 
-            for &ch in &chars[..start_chars.min(chars.len())] {
+            // 计算开头部分
+            let mut current_width = 0;
+            let mut start_end = 0;
+            for (i, ch) in chars.iter().enumerate() {
+                let char_width = ch.width().unwrap_or(0);
+                if current_width + char_width > start_chars {
+                    break;
+                }
+                current_width += char_width;
+                start_end = i + 1;
+            }
+
+            // 添加开头部分
+            for &ch in &chars[..start_end] {
                 result.push(ch);
             }
             result.push_str("...");
-            if chars.len() > start_chars {
-                let start_pos = chars.len().saturating_sub(end_chars);
-                for &ch in &chars[start_pos..] {
+
+            // 计算结尾部分
+            if chars.len() > start_end {
+                let mut end_width = 0;
+                let mut end_start = chars.len();
+                for (i, ch) in chars.iter().enumerate().rev() {
+                    let char_width = ch.width().unwrap_or(0);
+                    if end_width + char_width > end_chars {
+                        break;
+                    }
+                    end_width += char_width;
+                    end_start = i;
+                }
+
+                for &ch in &chars[end_start..] {
                     result.push(ch);
                 }
             }
         } else {
             // 如果空间太小，只保留开头部分
-            for &ch in &chars[..available.min(chars.len())] {
-                result.push(ch);
+            let mut current_width = 0;
+            for ch in chars.iter() {
+                let char_width = ch.width().unwrap_or(0);
+                if current_width + char_width > available {
+                    break;
+                }
+                current_width += char_width;
+                result.push(*ch);
             }
             result.push_str("...");
         }
@@ -286,6 +320,37 @@ fn output_summary(report: &DirReport) {
     println!("{}", "═".repeat(display_width).cyan().bold());
 }
 
+// 辅助函数：计算文本的显示宽度（包括颜色代码）
+fn get_display_width(text: &str) -> usize {
+    // 移除ANSI颜色代码后计算宽度
+    let without_ansi = strip_ansi_codes(text);
+    without_ansi.width()
+}
+
+// 简单的ANSI代码移除函数
+fn strip_ansi_codes(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_escape = false;
+
+    for ch in text.chars() {
+        if ch == '\x1b' {
+            in_escape = true;
+            continue;
+        }
+
+        if in_escape {
+            if ch == 'm' {
+                in_escape = false;
+            }
+            continue;
+        }
+
+        result.push(ch);
+    }
+
+    result
+}
+
 fn output_text(report: &DirReport, show_chart: bool) {
     let terminal_width = get_terminal_width();
     let display_width = terminal_width.min(80); // 限制显示宽度
@@ -334,6 +399,11 @@ fn output_text(report: &DirReport, show_chart: bool) {
             truncated_name.white()
         };
 
+        // 计算实际的显示宽度，并添加适当的空格来对齐
+        let actual_width = get_display_width(&strip_ansi_codes(&truncated_name));
+        let padding_needed = filename_width.saturating_sub(actual_width);
+        let padding = " ".repeat(padding_needed);
+
         if show_chart {
             let bar_length = if max_size > 0 {
                 ((entry.size as f64 / max_size as f64) * 40.0) as usize
@@ -349,21 +419,21 @@ fn output_text(report: &DirReport, show_chart: bool) {
             };
 
             println!(
-                "{} {:<width$} {:>12} [{}{}]",
+                "{} {}{} {:>12} [{}{}]",
                 type_icon,
                 colored_name,
+                padding,
                 size_str.cyan(),
                 bar_colored,
-                " ".repeat(40 - bar_length),
-                width = filename_width
+                " ".repeat(40 - bar_length)
             );
         } else {
             println!(
-                "{} {:<width$} {:>12}",
+                "{} {}{} {:>12}",
                 type_icon,
                 colored_name,
-                size_str.cyan(),
-                width = filename_width
+                padding,
+                size_str.cyan()
             );
         }
     }
