@@ -41,9 +41,15 @@ cd yp
 # 普通编译
 cargo build --release
 
-# 静态链接编译（推荐用于分发）
-rustup target add x86_64-unknown-linux-musl
+
+rustup target add x86_64-unknown-linux-musl # 静态链接编译
 cargo build --target x86_64-unknown-linux-musl --release
+
+rustup target add x86_64-pc-windows-gnu # Windows编译
+cargo build --target x86_64-pc-windows-gnu --release
+
+rustup target add x86_64-apple-darwin # macOS编译
+cargo build --target x86_64-apple-darwin --release
 ```
 
 编译后的二进制文件位于：
