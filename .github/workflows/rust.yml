@@ -1,0 +1,258 @@
+name: Multi-Platform Build
+
+on:
+  # 仅支持手动触发
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux targets
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: loongarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          
+          # Windows targets
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            cross: true
+          
+          # macOS targets
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Install musl-tools (Linux musl targets)
+      if: matrix.target == 'x86_64-unknown-linux-musl'
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+    - name: Install cross-compilation tool
+      if: matrix.cross
+      run: cargo install cross --git https://github.com/cross-rs/cross
+
+    - name: Build with cargo (native)
+      if: matrix.cross == false
+      run: cargo build --release --target ${{ matrix.target }} --verbose
+
+    - name: Build with cross (cross-compilation)
+      if: matrix.cross == true
+      run: cross build --release --target ${{ matrix.target }} --verbose
+
+    - name: Create artifact directory
+      run: mkdir -p artifacts
+
+    - name: Copy binary (Unix)
+      if: matrix.os != 'windows-latest'
+      run: cp target/${{ matrix.target }}/release/yp artifacts/yp-${{ matrix.target }}
+
+    - name: Copy binary (Windows)
+      if: matrix.os == 'windows-latest'
+      run: cp target/${{ matrix.target }}/release/yp.exe artifacts/yp-${{ matrix.target }}.exe
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: yp-${{ matrix.target }}
+        path: artifacts/*
+
+  # 自动发布到GitHub Release
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: all-artifacts
+
+    - name: Display structure of downloaded files
+      run: ls -la all-artifacts/
+
+    - name: Prepare release files
+      run: |
+        mkdir -p release-files
+        cd all-artifacts
+        
+        # 复制所有二进制文件到release-files目录
+        for dir in */; do
+          echo "Processing directory: $dir"
+          cd "$dir"
+          for file in *; do
+            if [[ "$file" == *.exe ]]; then
+              # Windows 可执行文件
+              cp "$file" "../../release-files/"
+            else
+              # Unix 可执行文件，重命名以便区分
+              cp "$file" "../../release-files/"
+            fi
+          done
+          cd ..
+        done
+        
+        cd ../release-files
+        ls -la
+        
+        # 为每个文件创建zip压缩包
+        for file in *; do
+          if [[ "$file" == *windows* ]]; then
+            zip "${file}.zip" "$file"
+          else
+            tar -czf "${file}.tar.gz" "$file"
+          fi
+        done
+        
+        # 显示最终的发布文件
+        echo "Release files:"
+        ls -la *.tar.gz *.zip 2>/dev/null || echo "No compressed files found"
+
+    - name: Get version from Cargo.toml
+      id: get_version
+      run: |
+        VERSION=$(grep '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+        echo "version=v$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: v$VERSION"
+
+    - name: Get current date
+      id: get_date
+      run: |
+        DATE=$(date +'%Y%m%d_%H%M%S')
+        echo "date=$DATE" >> $GITHUB_OUTPUT
+        echo "Date: $DATE"
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}-${{ steps.get_date.outputs.date }}
+        release_name: Release ${{ steps.get_version.outputs.version }} (${{ steps.get_date.outputs.date }})
+        body: |
+          ## yp ${{ steps.get_version.outputs.version }}
+          
+          Auto-generated release with multi-platform binaries.
+          
+          ### Supported Platforms:
+          - Linux x86_64 (musl)
+          - Linux aarch64 (musl) 
+          - Linux loongarch64 (musl)
+          - Windows x86_64
+          - Windows aarch64
+          - macOS x86_64
+          - macOS aarch64 (Apple Silicon)
+          
+          ### Usage:
+          1. Download the appropriate binary for your platform
+          2. Extract the archive (tar.gz for Unix/Linux/macOS, zip for Windows)
+          3. Make the binary executable (Unix/Linux/macOS): `chmod +x yp-*`
+          4. Run the program
+          
+          Built on: ${{ steps.get_date.outputs.date }}
+        draft: false
+        prerelease: false
+
+    - name: Upload Linux x86_64 musl
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-files/yp-x86_64-unknown-linux-musl.tar.gz
+        asset_name: yp-x86_64-unknown-linux-musl.tar.gz
+        asset_content_type: application/gzip
+
+    - name: Upload Linux aarch64 musl
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-files/yp-aarch64-unknown-linux-musl.tar.gz
+        asset_name: yp-aarch64-unknown-linux-musl.tar.gz
+        asset_content_type: application/gzip
+
+    - name: Upload Linux loongarch64 musl
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-files/yp-loongarch64-unknown-linux-musl.tar.gz
+        asset_name: yp-loongarch64-unknown-linux-musl.tar.gz
+        asset_content_type: application/gzip
+
+    - name: Upload Windows x86_64
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-files/yp-x86_64-pc-windows-msvc.exe.zip
+        asset_name: yp-x86_64-pc-windows-msvc.zip
+        asset_content_type: application/zip
+
+    - name: Upload Windows aarch64
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-files/yp-aarch64-pc-windows-msvc.exe.zip
+        asset_name: yp-aarch64-pc-windows-msvc.zip
+        asset_content_type: application/zip
+
+    - name: Upload macOS x86_64
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-files/yp-x86_64-apple-darwin.tar.gz
+        asset_name: yp-x86_64-apple-darwin.tar.gz
+        asset_content_type: application/gzip
+
+    - name: Upload macOS aarch64 (Apple Silicon)
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-files/yp-aarch64-apple-darwin.tar.gz
+        asset_name: yp-aarch64-apple-darwin.tar.gz
+        asset_content_type: application/gzip
