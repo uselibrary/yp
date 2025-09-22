@@ -47,14 +47,58 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install Rust
+    - name: Install Rust with retry
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ matrix.target }}
+      env:
+        RUSTUP_IO_THREADS: "1"
+      continue-on-error: true
+      id: rust_install_attempt1
+
+    - name: Retry Rust installation if first attempt failed
+      if: steps.rust_install_attempt1.outcome == 'failure'
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+      env:
+        RUSTUP_IO_THREADS: "1"
+        RUSTUP_MAX_RETRIES: "10"
+      continue-on-error: true
+      id: rust_install_attempt2
+
+    - name: Final Rust installation attempt with manual setup
+      if: steps.rust_install_attempt2.outcome == 'failure'
+      run: |
+        # 手动安装Rust，使用更稳定的方式
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        source ~/.cargo/env
+        rustup target add ${{ matrix.target }}
+      env:
+        RUSTUP_IO_THREADS: "1"
+
+    - name: Ensure Rust is in PATH
+      run: |
+        source ~/.cargo/env || true
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Verify Rust installation
+      run: |
+        source ~/.cargo/env || true
+        rustc --version
+        cargo --version
+        rustup target list --installed
+        echo "Target ${{ matrix.target }} is available: $(rustup target list --installed | grep -q ${{ matrix.target }} && echo 'YES' || echo 'NO')"
 
     - name: Install musl-tools (Linux musl targets)
-      if: matrix.target == 'x86_64-unknown-linux-musl'
-      run: sudo apt-get update && sudo apt-get install -y musl-tools
+      if: contains(matrix.target, 'linux-musl')
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools musl-dev
+        # 为x86_64目标创建符号链接
+        if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+          sudo ln -sf /usr/bin/musl-gcc /usr/local/bin/x86_64-linux-musl-gcc || true
+        fi
 
     - name: Install Windows ARM64 build tools
       if: matrix.target == 'aarch64-pc-windows-msvc'
@@ -62,17 +106,50 @@ jobs:
         # 确保安装了正确的MSVC工具链
         rustup target add aarch64-pc-windows-msvc
 
-    - name: Install cross-compilation tool
+    - name: Install cross-compilation tool with retry
       if: matrix.cross
-      run: cargo install cross --git https://github.com/cross-rs/cross
+      run: |
+        source ~/.cargo/env || true
+        # 首次尝试安装cross
+        if ! cargo install cross --git https://github.com/cross-rs/cross; then
+          echo "First attempt failed, retrying..."
+          sleep 10
+          # 第二次尝试
+          if ! cargo install cross --git https://github.com/cross-rs/cross; then
+            echo "Second attempt failed, trying with different approach..."
+            sleep 10
+            # 第三次尝试，使用crates.io版本
+            cargo install cross
+          fi
+        fi
+        cross --version
+
+    - name: Pre-build environment check
+      run: |
+        source ~/.cargo/env || true
+        echo "=== Environment Check ==="
+        echo "Rust version: $(rustc --version)"
+        echo "Cargo version: $(cargo --version)"
+        echo "Target: ${{ matrix.target }}"
+        echo "Cross compilation: ${{ matrix.cross }}"
+        echo "Available targets:"
+        rustup target list --installed
+        if [[ "${{ matrix.cross }}" == "true" ]]; then
+          echo "Cross version: $(cross --version)"
+        fi
+        echo "========================="
 
     - name: Build with cargo (native)
       if: matrix.cross == false
-      run: cargo build --release --target ${{ matrix.target }} --verbose
+      run: |
+        source ~/.cargo/env || true
+        cargo build --release --target ${{ matrix.target }} --verbose
 
     - name: Build with cross (cross-compilation)
       if: matrix.cross == true
-      run: cross build --release --target ${{ matrix.target }} --verbose
+      run: |
+        source ~/.cargo/env || true
+        cross build --release --target ${{ matrix.target }} --verbose
 
     - name: Create artifact directory
       run: mkdir -p artifacts
