@@ -33,7 +33,7 @@ jobs:
             cross: false
           - target: aarch64-pc-windows-msvc
             os: windows-latest
-            cross: true
+            cross: false
           
           # macOS targets
           - target: x86_64-apple-darwin
@@ -55,6 +55,12 @@ jobs:
     - name: Install musl-tools (Linux musl targets)
       if: matrix.target == 'x86_64-unknown-linux-musl'
       run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+    - name: Install Windows ARM64 build tools
+      if: matrix.target == 'aarch64-pc-windows-msvc'
+      run: |
+        # 确保安装了正确的MSVC工具链
+        rustup target add aarch64-pc-windows-msvc
 
     - name: Install cross-compilation tool
       if: matrix.cross
