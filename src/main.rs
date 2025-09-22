@@ -1,11 +1,12 @@
+// src/main.rs
 use clap::{Arg, Command};
 use colored::*;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use terminal_size::{Width, terminal_size};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DirEntry {
@@ -25,9 +26,9 @@ struct DirReport {
 fn main() {
     let matches = Command::new("yp")
         .name("YP - 目录空间查看器")
-        .version("0.1.3")
+        .version("0.2.0")
         .author("Your Name")
-        .about("一个功能强大的目录空间占用查看工具")
+        .about("一个高性能的目录空间占用查看工具（并行、一次遍历聚合）")
         .arg(
             Arg::new("path")
                 .short('p')
@@ -40,35 +41,35 @@ fn main() {
             Arg::new("sort")
                 .short('s')
                 .long("sort")
-                .help("按大小排序显示")
+                .help("按大小从大到小排序显示")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("json")
                 .short('j')
                 .long("json")
-                .help("以JSON格式输出")
+                .help("以 JSON 格式输出")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("chart")
                 .short('c')
                 .long("chart")
-                .help("显示ASCII艺术风格条形图")
+                .help("显示 ASCII 条形图")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("recursive")
                 .short('r')
                 .long("recursive")
-                .help("递归显示所有子目录")
+                .help("递归显示所有子目录（列出整棵子树）")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("summary")
                 .short('S')
                 .long("summary")
-                .help("只显示目录和总大小，不显示详细内容")
+                .help("只显示目录/总大小/项目数，不显示详细条目")
                 .action(clap::ArgAction::SetTrue),
         )
         .get_matches();
@@ -83,7 +84,9 @@ fn main() {
     match analyze_directory(path, recursive) {
         Ok(mut report) => {
             if sort_by_size {
-                report.entries.sort_by(|a, b| b.size.cmp(&a.size));
+                report
+                    .entries
+                    .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
             }
 
             if json_output {
@@ -105,85 +108,192 @@ fn main() {
     }
 }
 
+/// 顶层分析入口：
+/// - 递归模式：一次并行遍历整棵子树，返回所有条目（含文件与目录），并聚合 total_size（仅文件之和）
+/// - 非递归模式：并行处理“直接子项”；
+///    - 文件：直接读取大小；
+///    - 目录：并行计算其子树大小，但不展开其子项到 entries（只返回该目录一条记录）。
 fn analyze_directory(path: &str, recursive: bool) -> Result<DirReport, Box<dyn std::error::Error>> {
-    let path = Path::new(path);
-    if !path.exists() {
-        return Err(format!("路径不存在: {}", path.display()).into());
+    let root = Path::new(path);
+    if !root.exists() {
+        return Err(format!("路径不存在: {}", root.display()).into());
     }
-
-    let mut entries = Vec::new();
-    let mut total_size = 0u64;
+    if !root.is_dir() {
+        // 与原语义保持一致：允许给文件路径，输出一个“父目录”的报告也不直观；
+        // 这里直接把该文件作为单条记录返回。
+        let meta = fs::metadata(root)?;
+        let size = meta.len();
+        let entry = DirEntry {
+            name: root
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.display().to_string()),
+            size,
+            is_dir: false,
+            path: root.to_string_lossy().to_string(),
+        };
+        return Ok(DirReport {
+            total_size: size,
+            entries: vec![entry],
+            path: root.to_string_lossy().to_string(),
+        });
+    }
 
     if recursive {
-        // 递归遍历所有文件和目录
-        for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
-            if entry.path() == path {
-                continue; // 跳过根目录本身
-            }
-
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let size = if metadata.is_file() {
-                metadata.len()
-            } else {
-                calculate_dir_size(entry.path())?
-            };
-
-            total_size += if metadata.is_file() { size } else { 0 };
-
-            entries.push(DirEntry {
-                name: entry.file_name().to_string_lossy().to_string(),
-                size,
-                is_dir: metadata.is_dir(),
-                path: entry.path().to_string_lossy().to_string(),
-            });
-        }
+        // 并行递归：一次遍历，返回所有条目（不包含根目录本身）
+        let (_, entries) = scan_dir_recursive(root)?;
+        let total_size = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+        Ok(DirReport {
+            total_size,
+            entries,
+            path: root.to_string_lossy().to_string(),
+        })
     } else {
-        // 只分析当前目录的直接子项
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-            let name = entry.file_name().to_string_lossy().to_string();
+        // 非递归：并行处理直接子项；目录大小为其整个子树大小，但不展开其子节点到 entries
+        let read_dir = fs::read_dir(root)?;
+        let items: Vec<_> = read_dir.collect();
+        let items: Vec<_> = items
+            .into_par_iter()
+            .filter_map(|res| res.ok())
+            .filter_map(|entry| {
+                let p = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                match entry.metadata() {
+                    Ok(m) => {
+                        if m.is_file() {
+                            let size = m.len();
+                            Some(DirEntry {
+                                name,
+                                size,
+                                is_dir: false,
+                                path: p.to_string_lossy().to_string(),
+                            })
+                        } else if m.is_dir() {
+                            // 计算该目录的整个子树大小（一次遍历该子树），但不展开
+                            match dir_size_parallel(&p) {
+                                Ok(size) => Some(DirEntry {
+                                    name,
+                                    size,
+                                    is_dir: true,
+                                    path: p.to_string_lossy().to_string(),
+                                }),
+                                Err(_) => None, // 跳过不可访问目录
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None, // 跳过无法读取元数据的条目
+                }
+            })
+            .collect();
 
-            let size = if metadata.is_file() {
-                metadata.len()
-            } else {
-                calculate_dir_size(&entry.path())?
-            };
-
-            total_size += size;
-
-            entries.push(DirEntry {
-                name,
-                size,
-                is_dir: metadata.is_dir(),
-                path: entry.path().to_string_lossy().to_string(),
-            });
-        }
+        let total_size = items.iter().map(|e| e.size).sum();
+        Ok(DirReport {
+            total_size,
+            entries: items,
+            path: root.to_string_lossy().to_string(),
+        })
     }
-
-    Ok(DirReport {
-        total_size,
-        entries,
-        path: path.to_string_lossy().to_string(),
-    })
 }
 
-fn calculate_dir_size(path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
-    let mut size = 0u64;
-
-    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
-        if let Ok(metadata) = entry.metadata()
-            && metadata.is_file()
-        {
-            size += metadata.len();
-        }
+/// 并行计算某目录子树的总文件大小（O(N) 一次遍历）。
+fn dir_size_parallel(path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
+    if !path.is_dir() {
+        let meta = fs::metadata(path)?;
+        return Ok(if meta.is_file() { meta.len() } else { 0 });
     }
 
-    Ok(size)
+    // 并行地遍历直接子项；对文件直接计入，对目录递归调用。
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(0), // 无权限等情况：按 0 处理
+    };
+    let entries: Vec<_> = read_dir.collect();
+
+    let sum = entries
+        .into_par_iter()
+        .filter_map(|e| e.ok())
+        .map(|entry| {
+            let p = entry.path();
+            match entry.metadata() {
+                Ok(m) => {
+                    if m.is_file() {
+                        m.len()
+                    } else if m.is_dir() {
+                        // 递归地并行求和
+                        dir_size_parallel(&p).unwrap_or(0)
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => 0,
+            }
+        })
+        .sum();
+
+    Ok(sum)
+}
+
+/// 递归并行扫描子树，返回 (该子树文件总大小, 子树所有条目列表)。
+/// 返回的 entries **包含** 所有文件与目录条目（不包含 root 本身，以便顶层保持与旧行为一致）。
+fn scan_dir_recursive(path: &Path) -> Result<(u64, Vec<DirEntry>), Box<dyn std::error::Error>> {
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(_) => return Ok((0, Vec::new())), // 无权限：返回空
+    };
+    let children: Vec<_> = read_dir.collect();
+
+    // 用 rayon 对直接子项做并行处理；每个目录子项自身再并行递归。
+    let results: Vec<(u64, Vec<DirEntry>)> = children
+        .into_par_iter()
+        .filter_map(|res| res.ok())
+        .map(|entry| {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            match entry.metadata() {
+                Ok(m) => {
+                    if m.is_file() {
+                        let size = m.len();
+                        let me = DirEntry {
+                            name,
+                            size,
+                            is_dir: false,
+                            path: p.to_string_lossy().to_string(),
+                        };
+                        (size, vec![me])
+                    } else if m.is_dir() {
+                        // 递归：拿到子树大小与其条目，然后把“目录本身”也作为一条记录加入
+                        match scan_dir_recursive(&p) {
+                            Ok((sub_size, mut sub_entries)) => {
+                                let me = DirEntry {
+                                    name,
+                                    size: sub_size,
+                                    is_dir: true,
+                                    path: p.to_string_lossy().to_string(),
+                                };
+                                sub_entries.push(me);
+                                (sub_size, sub_entries)
+                            }
+                            Err(_) => (0, Vec::new()),
+                        }
+                    } else {
+                        (0, Vec::new())
+                    }
+                }
+                Err(_) => (0, Vec::new()),
+            }
+        })
+        .collect();
+
+    let mut total = 0u64;
+    let mut all_entries = Vec::new();
+    for (sz, mut list) in results {
+        total += sz;
+        all_entries.append(&mut list);
+    }
+    Ok((total, all_entries))
 }
 
 fn format_size(size: u64) -> String {
@@ -203,6 +313,7 @@ fn format_size(size: u64) -> String {
     }
 }
 
+/// 尽量保持和原逻辑一致的“中间省略”截断（仍基于 char/宽度，复杂 emoji 可能有边缘情况）
 fn truncate_filename(name: &str, max_width: usize) -> String {
     let display_width = name.width();
 
@@ -213,14 +324,13 @@ fn truncate_filename(name: &str, max_width: usize) -> String {
     } else {
         let mut result = String::new();
         let chars: Vec<char> = name.chars().collect();
-        let available = max_width - 3; // 为"..."保留空间
+        let available = max_width - 3;
 
-        // 尝试保留开头和结尾
         if available >= 6 {
             let start_chars = available / 2;
             let end_chars = available - start_chars;
 
-            // 计算开头部分
+            // 前半段
             let mut current_width = 0;
             let mut start_end = 0;
             for (i, ch) in chars.iter().enumerate() {
@@ -231,14 +341,12 @@ fn truncate_filename(name: &str, max_width: usize) -> String {
                 current_width += char_width;
                 start_end = i + 1;
             }
-
-            // 添加开头部分
             for &ch in &chars[..start_end] {
                 result.push(ch);
             }
             result.push_str("...");
 
-            // 计算结尾部分
+            // 后半段
             if chars.len() > start_end {
                 let mut end_width = 0;
                 let mut end_start = chars.len();
@@ -250,13 +358,12 @@ fn truncate_filename(name: &str, max_width: usize) -> String {
                     end_width += char_width;
                     end_start = i;
                 }
-
                 for &ch in &chars[end_start..] {
                     result.push(ch);
                 }
             }
         } else {
-            // 如果空间太小，只保留开头部分
+            // 空间较小，只保留开头
             let mut current_width = 0;
             for ch in chars.iter() {
                 let char_width = ch.width().unwrap_or(0);
@@ -275,35 +382,41 @@ fn truncate_filename(name: &str, max_width: usize) -> String {
 
 fn get_terminal_width() -> usize {
     if let Some((Width(w), _)) = terminal_size() {
-        w as usize
+        // 更好地利用宽度，上限放宽到 160
+        (w as usize).clamp(60, 160)
     } else {
-        80 // 默认宽度
+        100 // 默认宽度
     }
 }
 
 fn output_json(report: &DirReport) {
     match serde_json::to_string_pretty(report) {
         Ok(json) => println!("{}", json),
-        Err(e) => eprintln!("JSON序列化错误: {}", e),
+        Err(e) => eprintln!("JSON 序列化错误: {}", e),
     }
 }
 
 fn output_json_summary(report: &DirReport) {
+    let (file_cnt, dir_cnt) = report.entries.iter().fold((0usize, 0usize), |(f, d), e| {
+        if e.is_dir { (f, d + 1) } else { (f + 1, d) }
+    });
+
     let summary = serde_json::json!({
         "path": report.path,
         "total_size": report.total_size,
-        "file_count": report.entries.len()
+        "item_count": report.entries.len(),
+        "file_count": file_cnt,
+        "dir_count": dir_cnt
     });
 
     match serde_json::to_string_pretty(&summary) {
         Ok(json) => println!("{}", json),
-        Err(e) => eprintln!("JSON序列化错误: {}", e),
+        Err(e) => eprintln!("JSON 序列化错误: {}", e),
     }
 }
 
 fn output_summary(report: &DirReport) {
-    let terminal_width = get_terminal_width();
-    let display_width = terminal_width.min(80); // 限制显示宽度
+    let display_width = get_terminal_width();
 
     println!("{}", "═".repeat(display_width).cyan().bold());
     println!("{} {}", "目录:".green().bold(), report.path.yellow());
@@ -320,14 +433,7 @@ fn output_summary(report: &DirReport) {
     println!("{}", "═".repeat(display_width).cyan().bold());
 }
 
-// 辅助函数：计算文本的显示宽度（包括颜色代码）
-fn get_display_width(text: &str) -> usize {
-    // 移除ANSI颜色代码后计算宽度
-    let without_ansi = strip_ansi_codes(text);
-    without_ansi.width()
-}
-
-// 简单的ANSI代码移除函数
+// 去除 ANSI 颜色码（简易版，匹配 \x1b ... m）
 fn strip_ansi_codes(text: &str) -> String {
     let mut result = String::new();
     let mut in_escape = false;
@@ -337,14 +443,12 @@ fn strip_ansi_codes(text: &str) -> String {
             in_escape = true;
             continue;
         }
-
         if in_escape {
             if ch == 'm' {
                 in_escape = false;
             }
             continue;
         }
-
         result.push(ch);
     }
 
@@ -352,8 +456,7 @@ fn strip_ansi_codes(text: &str) -> String {
 }
 
 fn output_text(report: &DirReport, show_chart: bool) {
-    let terminal_width = get_terminal_width();
-    let display_width = terminal_width.min(80); // 限制显示宽度
+    let display_width = get_terminal_width();
 
     println!("{}", "═".repeat(display_width).cyan().bold());
     println!("{} {}", "目录:".green().bold(), report.path.yellow());
@@ -369,29 +472,25 @@ fn output_text(report: &DirReport, show_chart: bool) {
         return;
     }
 
-    // 计算布局参数
-    let size_width = 12; // 大小列的宽度
-    let chart_width = if show_chart { 42 } else { 0 }; // 条形图宽度 [40个字符 + 2个括号]
+    // 布局参数
+    let size_width = 12;
+    let chart_width = if show_chart { 42 } else { 0 }; // [40 个块 + 两侧括号]
     let icon_width = 3; // emoji + 空格
-    let spacing = 2; // 列之间的间距
+    let spacing = 2;
 
-    // 计算文件名可用宽度（使用显示宽度而不是终端宽度）
     let used_width = icon_width + size_width + chart_width + spacing * 2;
     let filename_width = if display_width > used_width + 10 {
         display_width - used_width
     } else {
-        30 // 最小宽度
+        30
     };
 
-    // 计算最大大小用于条形图
     let max_size = report.entries.iter().map(|e| e.size).max().unwrap_or(1);
 
     for entry in &report.entries {
         let size_str = format_size(entry.size);
-
         let type_icon = if entry.is_dir { "📁" } else { "📄" };
 
-        // 截断文件名以适应可用空间
         let truncated_name = truncate_filename(&entry.name, filename_width);
         let colored_name = if entry.is_dir {
             truncated_name.blue().bold()
@@ -399,18 +498,18 @@ fn output_text(report: &DirReport, show_chart: bool) {
             truncated_name.white()
         };
 
-        // 计算实际的显示宽度，并添加适当的空格来对齐
-        let actual_width = get_display_width(&strip_ansi_codes(&truncated_name));
+        // 以“去色后的可见宽度”计算填充
+        let actual_width = strip_ansi_codes(&truncated_name).width();
         let padding_needed = filename_width.saturating_sub(actual_width);
         let padding = " ".repeat(padding_needed);
 
         if show_chart {
             let bar_length = if max_size > 0 {
-                ((entry.size as f64 / max_size as f64) * 40.0) as usize
+                ((entry.size as f64 / max_size as f64) * 40.0).round() as usize
             } else {
                 0
             };
-
+            let bar_length = bar_length.min(40);
             let bar = "█".repeat(bar_length);
             let bar_colored = if entry.is_dir {
                 bar.blue()
