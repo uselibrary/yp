@@ -67,8 +67,8 @@ jobs:
       continue-on-error: true
       id: rust_install_attempt2
 
-    - name: Final Rust installation attempt with manual setup
-      if: steps.rust_install_attempt2.outcome == 'failure'
+    - name: Final Rust installation attempt with manual setup (Unix)
+      if: steps.rust_install_attempt2.outcome == 'failure' && runner.os != 'Windows'
       run: |
         # 手动安装Rust，使用更稳定的方式
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -77,18 +77,47 @@ jobs:
       env:
         RUSTUP_IO_THREADS: "1"
 
-    - name: Ensure Rust is in PATH
+    - name: Final Rust installation attempt with manual setup (Windows)
+      if: steps.rust_install_attempt2.outcome == 'failure' && runner.os == 'Windows'
+      run: |
+        # Windows手动安装Rust
+        Invoke-WebRequest -Uri https://win.rustup.rs -OutFile rustup-init.exe
+        .\rustup-init.exe -y --default-toolchain stable
+        & "$env:USERPROFILE\.cargo\bin\rustup.exe" target add ${{ matrix.target }}
+      env:
+        RUSTUP_IO_THREADS: "1"
+
+    - name: Ensure Rust is in PATH (Unix)
+      if: runner.os != 'Windows'
       run: |
         source ~/.cargo/env || true
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-    - name: Verify Rust installation
+    - name: Ensure Rust is in PATH (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        echo "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Verify Rust installation (Unix)
+      if: runner.os != 'Windows'
       run: |
         source ~/.cargo/env || true
         rustc --version
         cargo --version
         rustup target list --installed
         echo "Target ${{ matrix.target }} is available: $(rustup target list --installed | grep -q ${{ matrix.target }} && echo 'YES' || echo 'NO')"
+
+    - name: Verify Rust installation (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        rustc --version
+        cargo --version
+        rustup target list --installed
+        if (rustup target list --installed | Select-String "${{ matrix.target }}") { 
+          Write-Host "Target ${{ matrix.target }} is available: YES" 
+        } else { 
+          Write-Host "Target ${{ matrix.target }} is available: NO" 
+        }
 
     - name: Install musl-tools (Linux musl targets)
       if: contains(matrix.target, 'linux-musl')
@@ -106,8 +135,8 @@ jobs:
         # 确保安装了正确的MSVC工具链
         rustup target add aarch64-pc-windows-msvc
 
-    - name: Install cross-compilation tool with retry
-      if: matrix.cross
+    - name: Install cross-compilation tool with retry (Unix)
+      if: matrix.cross && runner.os != 'Windows'
       run: |
         source ~/.cargo/env || true
         # 首次尝试安装cross
@@ -124,7 +153,27 @@ jobs:
         fi
         cross --version
 
-    - name: Pre-build environment check
+    - name: Install cross-compilation tool with retry (Windows)
+      if: matrix.cross && runner.os == 'Windows'
+      run: |
+        # 首次尝试安装cross
+        try {
+          cargo install cross --git https://github.com/cross-rs/cross
+        } catch {
+          Write-Host "First attempt failed, retrying..."
+          Start-Sleep 10
+          try {
+            cargo install cross --git https://github.com/cross-rs/cross
+          } catch {
+            Write-Host "Second attempt failed, trying with different approach..."
+            Start-Sleep 10
+            cargo install cross
+          }
+        }
+        cross --version
+
+    - name: Pre-build environment check (Unix)
+      if: runner.os != 'Windows'
       run: |
         source ~/.cargo/env || true
         echo "=== Environment Check ==="
@@ -139,20 +188,50 @@ jobs:
         fi
         echo "========================="
 
-    - name: Build with cargo (native)
-      if: matrix.cross == false
+    - name: Pre-build environment check (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        Write-Host "=== Environment Check ==="
+        Write-Host "Rust version: $(rustc --version)"
+        Write-Host "Cargo version: $(cargo --version)"
+        Write-Host "Target: ${{ matrix.target }}"
+        Write-Host "Cross compilation: ${{ matrix.cross }}"
+        Write-Host "Available targets:"
+        rustup target list --installed
+        if ("${{ matrix.cross }}" -eq "true") {
+          Write-Host "Cross version: $(cross --version)"
+        }
+        Write-Host "========================="
+
+    - name: Build with cargo (native - Unix)
+      if: matrix.cross == false && runner.os != 'Windows'
       run: |
         source ~/.cargo/env || true
         cargo build --release --target ${{ matrix.target }} --verbose
 
-    - name: Build with cross (cross-compilation)
-      if: matrix.cross == true
+    - name: Build with cargo (native - Windows)
+      if: matrix.cross == false && runner.os == 'Windows'
+      run: |
+        cargo build --release --target ${{ matrix.target }} --verbose
+
+    - name: Build with cross (cross-compilation - Unix)
+      if: matrix.cross == true && runner.os != 'Windows'
       run: |
         source ~/.cargo/env || true
         cross build --release --target ${{ matrix.target }} --verbose
 
-    - name: Create artifact directory
+    - name: Build with cross (cross-compilation - Windows)
+      if: matrix.cross == true && runner.os == 'Windows'
+      run: |
+        cross build --release --target ${{ matrix.target }} --verbose
+
+    - name: Create artifact directory (Unix)
+      if: runner.os != 'Windows'
       run: mkdir -p artifacts
+
+    - name: Create artifact directory (Windows)
+      if: runner.os == 'Windows'
+      run: New-Item -ItemType Directory -Force -Path artifacts
 
     - name: Copy binary (Unix)
       if: matrix.os != 'windows-latest'
