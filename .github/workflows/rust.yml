@@ -323,12 +323,14 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ steps.get_version.outputs.version }}-${{ steps.get_date.outputs.date }}
-        release_name: Release ${{ steps.get_version.outputs.version }} (${{ steps.get_date.outputs.date }})
+        tag_name: ${{ steps.get_version.outputs.version }}
+        release_name: Release ${{ steps.get_version.outputs.version }}
         body: |
           ## yp ${{ steps.get_version.outputs.version }}
           
           Auto-generated release with multi-platform binaries.
+          
+          **Built on:** ${{ steps.get_date.outputs.date }}
           
           ### Supported Platforms:
           - Linux x86_64 (musl)
@@ -344,8 +346,6 @@ jobs:
           2. Extract the archive (tar.gz for Unix/Linux/macOS, zip for Windows)
           3. Make the binary executable (Unix/Linux/macOS): `chmod +x yp-*`
           4. Run the program
-          
-          Built on: ${{ steps.get_date.outputs.date }}
         draft: false
         prerelease: false
 
