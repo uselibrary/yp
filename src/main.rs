@@ -458,32 +458,39 @@ fn strip_ansi_codes(text: &str) -> String {
 fn output_text(report: &DirReport, show_chart: bool) {
     let display_width = get_terminal_width();
 
-    println!("{}", "═".repeat(display_width).cyan().bold());
-    println!("{} {}", "目录:".green().bold(), report.path.yellow());
-    println!(
-        "{} {}",
-        "总大小:".green().bold(),
-        format_size(report.total_size).cyan().bold()
-    );
-    println!("{}", "═".repeat(display_width).cyan().bold());
-
-    if report.entries.is_empty() {
-        println!("{}", "目录为空".yellow());
-        return;
-    }
-
     // 布局参数
     let size_width = 12;
     let chart_width = if show_chart { 42 } else { 0 }; // [40 个块 + 两侧括号]
     let icon_width = 3; // emoji + 空格
     let spacing = 2;
 
+    // 计算合适的文件名宽度，避免过度宽泛
     let used_width = icon_width + size_width + chart_width + spacing * 2;
-    let filename_width = if display_width > used_width + 10 {
-        display_width - used_width
+    let available_width = display_width.saturating_sub(used_width);
+    let filename_width = if show_chart {
+        // 有图表时，文件名宽度适中
+        available_width.clamp(20, 50)
     } else {
-        30
+        // 无图表时，文件名宽度可以稍大但不过度
+        available_width.clamp(30, 80)
     };
+
+    // 计算实际使用的总宽度
+    let actual_width = icon_width + filename_width + size_width + chart_width + spacing * 2;
+
+    println!("{}", "═".repeat(actual_width).cyan().bold());
+    println!("{} {}", "目录:".green().bold(), report.path.yellow());
+    println!(
+        "{} {}",
+        "总大小:".green().bold(),
+        format_size(report.total_size).cyan().bold()
+    );
+    println!("{}", "═".repeat(actual_width).cyan().bold());
+
+    if report.entries.is_empty() {
+        println!("{}", "目录为空".yellow());
+        return;
+    }
 
     let max_size = report.entries.iter().map(|e| e.size).max().unwrap_or(1);
 
@@ -537,7 +544,7 @@ fn output_text(report: &DirReport, show_chart: bool) {
         }
     }
 
-    println!("{}", "═".repeat(display_width).cyan().bold());
+    println!("{}", "═".repeat(actual_width).cyan().bold());
     println!(
         "{} {} 个项目",
         "共计:".green().bold(),
