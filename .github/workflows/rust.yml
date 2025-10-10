@@ -341,11 +341,6 @@ jobs:
           - macOS x86_64
           - macOS aarch64 (Apple Silicon)
           
-          ### Usage:
-          1. Download the appropriate binary for your platform
-          2. Extract the archive (tar.gz for Unix/Linux/macOS, zip for Windows)
-          3. Make the binary executable (Unix/Linux/macOS): `chmod +x yp-*`
-          4. Run the program
         draft: false
         prerelease: false
 

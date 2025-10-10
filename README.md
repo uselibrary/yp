@@ -233,6 +233,9 @@ yp -e target
 # Git repositories: exclude version control directory
 yp -e .git
 
+# Path-based exclusion
+yp -e path/to/exclude
+
 # Node.js projects: exclude dependencies and build artifacts
 yp -e node_modules -e dist -e build
 
@@ -329,8 +332,10 @@ If colors don't appear correctly:
 
 ## 📈 Changelog
 
+### v0.2.3 (latest)
+- 💡 **Path-based exclusion**: Support excluding files or folders by full path
 
-### v0.2.2 (latest)
+### v0.2.2
 - ✨ **Added**: Exclusion feature (`-e/--exclude`) - support for excluding specified files or folders
 - 🎯 **Smart exclusion**: Only applies to root directory, doesn't affect same-named items in subdirectories
 - 🔄 **Multiple exclusions**: Support using multiple `-e` parameters to exclude multiple items simultaneously
