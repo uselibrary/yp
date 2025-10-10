@@ -121,15 +121,35 @@ fn main() {
 }
 
 /// 检查路径是否应该被排除
-/// depth: 当前深度（0 表示根目录的直接子项）
-/// name: 文件/目录名称
-/// excludes: 排除模式列表
-/// only_root: 如果为 true，只在根目录（depth=0）应用排除规则
-fn should_exclude(depth: usize, name: &str, excludes: &[String], only_root: bool) -> bool {
-    if only_root && depth > 0 {
-        return false;
-    }
-    excludes.iter().any(|pattern| name == pattern)
+/// current_path: 当前完整路径
+/// root_path: 根目录路径
+/// excludes: 排除模式列表（支持名称或路径）
+fn should_exclude(current_path: &Path, root_path: &Path, excludes: &[String]) -> bool {
+    let name = current_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    excludes.iter().any(|pattern| {
+        // 如果包含路径分隔符，按路径匹配
+        if pattern.contains('/') || pattern.contains('\\') {
+            let pattern_path = Path::new(pattern);
+
+            // 如果是绝对路径，直接比较
+            if pattern_path.is_absolute() {
+                return current_path == pattern_path;
+            }
+
+            // 否则按相对路径匹配
+            if let Ok(relative) = current_path.strip_prefix(root_path) {
+                return relative == pattern_path;
+            }
+            false
+        } else {
+            // 简单名称匹配
+            name == pattern
+        }
+    })
 }
 
 /// 顶层分析入口：
@@ -169,8 +189,7 @@ fn analyze_directory(
 
     if recursive {
         // 并行递归：一次遍历，返回所有条目（不包含根目录本身）
-        // depth=0 表示根目录的直接子项
-        let (_, entries) = scan_dir_recursive(root, excludes, 0)?;
+        let (_, entries) = scan_dir_recursive(root, root, excludes)?;
         let total_size = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
         Ok(DirReport {
             total_size,
@@ -186,12 +205,13 @@ fn analyze_directory(
             .filter_map(|res| res.ok())
             .filter_map(|entry| {
                 let p = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
 
-                // 检查是否应该排除（depth=0 表示根目录的直接子项，only_root=true 只排除根目录下的项）
-                if should_exclude(0, &name, excludes, true) {
+                // 检查是否应该排除
+                if should_exclude(&p, root, excludes) {
                     return None;
                 }
+
+                let name = entry.file_name().to_string_lossy().to_string();
 
                 match entry.metadata() {
                     Ok(m) => {
@@ -205,8 +225,7 @@ fn analyze_directory(
                             })
                         } else if m.is_dir() {
                             // 计算该目录的整个子树大小（一次遍历该子树），但不展开
-                            // depth=1 因为这些是根目录的子目录
-                            match dir_size_parallel(&p, excludes, 1) {
+                            match dir_size_parallel(&p, root, excludes) {
                                 Ok(size) => Some(DirEntry {
                                     name,
                                     size,
@@ -236,8 +255,8 @@ fn analyze_directory(
 /// 并行计算某目录子树的总文件大小（O(N) 一次遍历）。
 fn dir_size_parallel(
     path: &Path,
+    root: &Path,
     excludes: &[String],
-    depth: usize,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     if !path.is_dir() {
         let meta = fs::metadata(path)?;
@@ -256,10 +275,9 @@ fn dir_size_parallel(
         .filter_map(|e| e.ok())
         .map(|entry| {
             let p = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
 
-            // 检查是否应该排除（only_root=true 只在根目录排除）
-            if should_exclude(depth, &name, excludes, true) {
+            // 检查是否应该排除
+            if should_exclude(&p, root, excludes) {
                 return 0;
             }
 
@@ -269,7 +287,7 @@ fn dir_size_parallel(
                         m.len()
                     } else if m.is_dir() {
                         // 递归地并行求和
-                        dir_size_parallel(&p, excludes, depth + 1).unwrap_or(0)
+                        dir_size_parallel(&p, root, excludes).unwrap_or(0)
                     } else {
                         0
                     }
@@ -286,8 +304,8 @@ fn dir_size_parallel(
 /// 返回的 entries **包含** 所有文件与目录条目（不包含 root 本身，以便顶层保持与旧行为一致）。
 fn scan_dir_recursive(
     path: &Path,
+    root: &Path,
     excludes: &[String],
-    depth: usize,
 ) -> Result<(u64, Vec<DirEntry>), Box<dyn std::error::Error>> {
     let read_dir = match fs::read_dir(path) {
         Ok(rd) => rd,
@@ -301,12 +319,13 @@ fn scan_dir_recursive(
         .filter_map(|res| res.ok())
         .map(|entry| {
             let p = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
 
-            // 检查是否应该排除（only_root=true 只在根目录排除）
-            if should_exclude(depth, &name, excludes, true) {
+            // 检查是否应该排除
+            if should_exclude(&p, root, excludes) {
                 return (0, Vec::new());
             }
+
+            let name = entry.file_name().to_string_lossy().to_string();
 
             match entry.metadata() {
                 Ok(m) => {
@@ -321,7 +340,7 @@ fn scan_dir_recursive(
                         (size, vec![me])
                     } else if m.is_dir() {
                         // 递归：拿到子树大小与其条目，然后把"目录本身"也作为一条记录加入
-                        match scan_dir_recursive(&p, excludes, depth + 1) {
+                        match scan_dir_recursive(&p, root, excludes) {
                             Ok((sub_size, mut sub_entries)) => {
                                 let me = DirEntry {
                                     name,
