@@ -25,6 +25,7 @@
 - 🔄 **多种排序**: 支持按文件大小排序
 - 📝 **多格式输出**: 支持文本和JSON格式输出
 - 📊 **简洁模式**: 支持只显示目录和总大小的简洁输出
+- 🚫 **智能排除**: 支持排除指定文件或文件夹（仅作用于根目录）
 - 🚀 **高性能**: 使用Rust编写，性能优异
 - 🔧 **静态编译**: 支持musl静态链接，无依赖部署
 - 🎯 **智能显示**: 自适应终端宽度，智能处理长文件名，确保完美对齐
@@ -37,7 +38,7 @@
 从[发布页面](https://github.com/uselibrary/yp/releases)下载预编译的二进制文件，选择适合您系统的版本。当前仅提供`x86_64-unknown-linux-musl`版本。
 将下载的二进制文件放置到`/usr/local/bin`中，并赋予可执行权限。示例操作如下：
 ```
-wget https://github.com/uselibrary/yp/releases/download/v0.1.3/yp-x86_64-unknown-linux-musl
+wget https://github.com/uselibrary/yp/releases/download/v0.2.2/yp-x86_64-unknown-linux-musl
 sudo mv yp-x86_64-unknown-linux-musl /usr/local/bin/yp
 sudo chmod +x /usr/local/bin/yp
 ```
@@ -89,6 +90,12 @@ yp -p /home -s -c
 
 # 简洁模式（只显示总大小）
 yp -S
+
+# 排除指定文件夹
+yp -e target
+
+# 排除多个文件夹
+yp -e target -e .git -e node_modules
 ```
 
 ### 高级选项
@@ -102,6 +109,9 @@ yp -j
 
 # 简洁模式JSON输出
 yp -S -j
+
+# 排除目录并显示（仅排除当前目录下的匹配项）
+yp -s -c -e target -e assets
 
 # 完整功能演示
 yp -p /usr -s -c -r
@@ -117,6 +127,7 @@ yp -p /usr -s -c -r
 | `-c` | `--chart` | 显示ASCII艺术风格条形图 |
 | `-r` | `--recursive` | 递归显示所有子目录 |
 | `-S` | `--summary` | 只显示目录和总大小，不显示详细内容。在 JSON 模式下，会额外输出 file_count 与 dir_count 字段。 |
+| `-e` | `--exclude <PATTERN>` | 排除指定的文件或文件夹（可多次使用，仅作用于当前目录） |
 | `-h` | `--help` | 显示帮助信息 |
 | `-V` | `--version` | 显示版本信息 |
 
@@ -175,6 +186,57 @@ yp -p /usr -s -c -r
 }
 ```
 
+## 🚫 排除功能详解
+
+### 排除策略
+排除功能采用**根目录排除策略**，只会排除指定目录的根级别的文件或文件夹，不会影响子目录中的同名项。
+
+### 使用示例
+
+```bash
+# 排除单个目录
+yp -e target
+
+# 排除多个目录
+yp -e target -e .git -e node_modules
+
+# 结合其他选项使用
+yp -s -c -e target -e assets
+yp -r -e .git -e target  # 递归模式也支持排除
+```
+
+### 排除行为说明
+
+假设目录结构如下：
+```
+project/
+├── target/          # 会被排除
+├── src/
+│   └── target/      # 不会被排除
+└── tests/
+    └── target/      # 不会被排除
+```
+
+使用 `yp -e target` 命令：
+- ✅ **会排除**: 根目录下的 `target` 文件夹
+- ❌ **不会排除**: `src/target` 和 `tests/target` 文件夹
+
+### 常见使用场景
+
+```bash
+# Rust 项目：排除编译产物
+yp -e target
+
+# Git 仓库：排除版本控制目录
+yp -e .git
+
+# Node.js 项目：排除依赖和构建产物
+yp -e node_modules -e dist -e build
+
+# 多语言项目：综合排除
+yp -e target -e .git -e node_modules -e __pycache__
+```
+
 ## 🎯 智能显示功能
 
 ### 自适应布局
@@ -224,7 +286,7 @@ yp -p /usr -s -c -r
 - **Unix系统**: 完整支持
 
 ### ⚠️ 部分支持
-- **Windows 10/11**: 核心功能完整，emoji显示可能异常
+- **Windows 10/11**: 核心功能完整，emoji显示可能异常；`Windows Terminal`完美支持所有功能
 - **旧版Windows**: 核心功能正常，彩色输出可能不支持
 
 ### 核心功能（所有平台）
@@ -264,7 +326,13 @@ cargo build --target x86_64-apple-darwin --release
 
 ## 📈 更新日志
 
-### v0.2.1 (最新)
+### v0.2.2 (最新)
+- ✨ **新增**: 排除功能 (`-e/--exclude`) - 支持排除指定的文件或文件夹
+- 🎯 **智能排除**: 仅作用于根目录，不影响子目录中的同名文件/文件夹
+- 🔄 **多重排除**: 支持使用多个 `-e` 参数同时排除多个项目
+- 💡 **使用场景**: 快速排除 `target`、`.git`、`node_modules` 等常见大型目录
+
+### v0.2.1
 - 🎯 **用户体验**: 调整UI/UX。
 
 ### v0.2.0 
