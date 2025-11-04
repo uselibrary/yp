@@ -26,9 +26,8 @@ struct DirReport {
 fn main() {
     let matches = Command::new("yp")
         .name("YP - 目录空间查看器")
-        .version("0.2.3")
-        .author("Your Name")
-        .about("一个高性能的目录空间占用查看工具（并行、一次遍历聚合）")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about(env!("CARGO_PKG_DESCRIPTION"))
         .arg(
             Arg::new("path")
                 .short('p')
