@@ -271,17 +271,31 @@ jobs:
         mkdir -p release-files
         cd all-artifacts
         
-        # 复制所有二进制文件到release-files目录
+        # 处理每个平台的二进制文件
         for dir in */; do
           echo "Processing directory: $dir"
+          target_name="${dir%/}"  # 去掉末尾的斜杠，得到 yp-x86_64-unknown-linux-musl 这样的名称
+          target_name="${target_name#yp-}"  # 去掉前缀 yp-，得到 x86_64-unknown-linux-musl
+          
           cd "$dir"
           for file in *; do
             if [[ "$file" == *.exe ]]; then
-              # Windows 可执行文件
-              cp "$file" "../../release-files/"
+              # Windows 可执行文件：压缩包名称为 yp-<target>.zip，解压后为 yp.exe
+              echo "Creating Windows archive for $target_name"
+              zip "../../release-files/yp-${target_name}.zip" "$file"
+              # 在zip中重命名为yp.exe
+              (cd ../../release-files && unzip -o "yp-${target_name}.zip" && mv "$file" yp.exe && zip "yp-${target_name}.zip" yp.exe && rm yp.exe)
             else
-              # Unix 可执行文件，重命名以便区分
-              cp "$file" "../../release-files/"
+              # Unix 可执行文件：压缩包名称为 yp-<target>.tar.gz，解压后为 yp
+              echo "Creating Unix archive for $target_name"
+              # 创建临时目录来重命名文件
+              temp_dir="../../release-files/temp-${target_name}"
+              mkdir -p "$temp_dir"
+              cp "$file" "$temp_dir/yp"
+              chmod +x "$temp_dir/yp"
+              # 创建tar.gz，只包含yp文件（不包含目录结构）
+              tar -czf "../../release-files/yp-${target_name}.tar.gz" -C "$temp_dir" yp
+              rm -rf "$temp_dir"
             fi
           done
           cd ..
@@ -290,18 +304,21 @@ jobs:
         cd ../release-files
         ls -la
         
-        # 为每个文件创建zip压缩包
-        for file in *; do
-          if [[ "$file" == *windows* ]]; then
-            zip "${file}.zip" "$file"
-          else
-            tar -czf "${file}.tar.gz" "$file"
-          fi
-        done
-        
         # 显示最终的发布文件
         echo "Release files:"
         ls -la *.tar.gz *.zip 2>/dev/null || echo "No compressed files found"
+        
+        # 验证压缩包内容
+        echo ""
+        echo "Verifying archive contents:"
+        for archive in *.tar.gz; do
+          echo "Contents of $archive:"
+          tar -tzf "$archive"
+        done
+        for archive in *.zip; do
+          echo "Contents of $archive:"
+          unzip -l "$archive"
+        done
 
     - name: Get version from Cargo.toml
       id: get_version
