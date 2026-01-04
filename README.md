@@ -82,10 +82,10 @@ yp
 # analyze a specific path
 yp -p /path/to/directory
 
-# sort by size
+# sort by size (默认启用；传入 `-s` 将禁用排序)
 yp -s
 
-# show ASCII bar chart
+# show ASCII bar chart (默认启用；传入 `-c` 将禁用图表)
 yp -c
 
 # combine options
@@ -114,10 +114,12 @@ yp -j
 yp -S -j
 
 # exclude directories and show (only excludes current directory matches)
-yp -s -c -e target -e assets
+# 排除时默认仍然启用排序和图表；传入 `-s` 或 `-c` 可以分别禁用它们
+yp -e target -e assets
 
 # full example
-yp -p /usr -s -c -r
+# 注意：排序和图表默认启用（等同于 `-s -c`）
+yp -p /usr -r
 ```
 
 ## 📋 Command-line options
@@ -125,9 +127,9 @@ yp -p /usr -s -c -r
 | Option | Long option | Description |
 |--------|-------------|-------------|
 | `-p` | `--path <PATH>` | Path to analyze (default: current directory) |
-| `-s` | `--sort` | Sort entries by size |
+| `-s` | `--sort` | Sort entries by size (enabled by default; providing `-s` disables sorting) |
 | `-j` | `--json` | Output JSON; in recursive mode includes all nested entries |
-| `-c` | `--chart` | Show ASCII-art bar chart |
+| `-c` | `--chart` | Show ASCII-art bar chart (enabled by default; providing `-c` disables chart) |
 | `-r` | `--recursive` | Recurse into all subdirectories |
 | `-S` | `--summary` | Show only directories and total size. In JSON mode this adds `file_count` and `dir_count` fields. |
 | `-e` | `--exclude <PATTERN>` | Exclude specified files or folders (can be used multiple times, current directory only) |

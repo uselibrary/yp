@@ -40,8 +40,9 @@ fn main() {
             Arg::new("sort")
                 .short('s')
                 .long("sort")
-                .help("按大小从大到小排序显示")
-                .action(clap::ArgAction::SetTrue),
+                .help("按大小从大到小排序显示（默认启用；使用该开关将禁用）")
+                .action(clap::ArgAction::SetFalse)
+                .default_value("true"),
         )
         .arg(
             Arg::new("json")
@@ -54,8 +55,9 @@ fn main() {
             Arg::new("chart")
                 .short('c')
                 .long("chart")
-                .help("显示 ASCII 条形图")
-                .action(clap::ArgAction::SetTrue),
+                .help("显示 ASCII 条形图（默认启用；使用该开关将禁用）")
+                .action(clap::ArgAction::SetFalse)
+                .default_value("true"),
         )
         .arg(
             Arg::new("recursive")
