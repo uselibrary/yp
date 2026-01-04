@@ -67,6 +67,13 @@ fn main() {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("tree")
+                .short('t')
+                .long("tree")
+                .help("以树状（tree）方式显示每个文件/目录及其大小（可与 -r 结合）")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("summary")
                 .short('S')
                 .long("summary")
@@ -87,6 +94,7 @@ fn main() {
     let sort_by_size = matches.get_flag("sort");
     let json_output = matches.get_flag("json");
     let show_chart = matches.get_flag("chart");
+    let tree_mode = matches.get_flag("tree");
     let recursive = matches.get_flag("recursive");
     let summary_only = matches.get_flag("summary");
     let excludes: Vec<String> = matches
@@ -96,6 +104,28 @@ fn main() {
 
     match analyze_directory(path, recursive, &excludes) {
         Ok(mut report) => {
+            if tree_mode {
+                // 打印树状结构。按是否递归决定是否进入子目录。
+                println!("{} {}", "目录:".green().bold(), report.path.yellow());
+                println!(
+                    "{} {}",
+                    "总大小:".green().bold(),
+                    format_size(report.total_size).cyan().bold()
+                );
+                // 以 root path 为起点，逐级打印
+                if let Err(e) = print_tree_dir(
+                    Path::new(path),
+                    Path::new(path),
+                    &excludes,
+                    "",
+                    sort_by_size,
+                    recursive,
+                ) {
+                    eprintln!("{} 打印树状视图时出错: {}", "错误:".red().bold(), e);
+                    std::process::exit(1);
+                }
+                return;
+            }
             if sort_by_size {
                 report
                     .entries
@@ -626,4 +656,85 @@ fn output_text(report: &DirReport, show_chart: bool) {
         "共计:".green().bold(),
         report.entries.len().to_string().yellow().bold()
     );
+}
+
+/// 打印树状结构（类似 tree）
+fn print_tree_dir(
+    path: &Path,
+    root: &Path,
+    excludes: &[String],
+    prefix: &str,
+    sort_by_size: bool,
+    recursive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(()),
+    };
+
+    // 收集子项并计算大小（对于目录使用 dir_size_parallel）
+    let mut items: Vec<(String, std::path::PathBuf, bool, u64)> = read_dir
+        .filter_map(|r| r.ok())
+        .filter_map(|entry| {
+            let p = entry.path();
+            if should_exclude(&p, root, excludes) {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            match entry.metadata() {
+                Ok(m) => {
+                    if m.is_file() {
+                        Some((name, p, false, m.len()))
+                    } else if m.is_dir() {
+                        // 计算目录大小（可能开销较大）
+                        match dir_size_parallel(&p, root, excludes) {
+                            Ok(sz) => Some((name, p, true, sz)),
+                            Err(_) => Some((name, p, true, 0)),
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        })
+        .collect();
+
+    if sort_by_size {
+        items.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+    } else {
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    let total = items.len();
+    for (i, (name, p, is_dir, sz)) in items.into_iter().enumerate() {
+        let is_last = i + 1 == total;
+        let branch = if is_last { "└── " } else { "├── " };
+        let icon = if is_dir { "📁" } else { "📄" };
+        let size_str = format_size(sz);
+        if is_dir {
+            println!("{}{} {} {}", prefix, branch, icon, name.blue().bold());
+            println!("{}         {}", prefix, size_str.cyan());
+        } else {
+            println!(
+                "{}{} {} {}",
+                prefix,
+                branch,
+                icon,
+                format!("{} {}", name, size_str).white()
+            );
+        }
+
+        if recursive && is_dir {
+            let new_prefix = if is_last {
+                format!("{}    ", prefix)
+            } else {
+                format!("{}│   ", prefix)
+            };
+            // 递归打印子目录
+            print_tree_dir(&p, root, excludes, &new_prefix, sort_by_size, recursive)?;
+        }
+    }
+
+    Ok(())
 }
