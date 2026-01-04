@@ -1,8 +1,13 @@
 name: Multi-Platform Build
 
 on:
-  # 仅支持手动触发
+  # 手动触发（支持可选的 release_tag）
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional: release tag to use (e.g. v1.2.3). Leave empty to auto-generate.'
+        required: false
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,6 +51,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Install Rust with retry
       uses: dtolnay/rust-toolchain@stable
@@ -334,23 +341,38 @@ jobs:
         echo "date=$DATE" >> $GITHUB_OUTPUT
         echo "Date: $DATE"
 
+    - name: Install jq (for JSON parsing)
+      run: |
+        sudo apt-get update && sudo apt-get install -y jq
+
     - name: Find or create Release
       id: create_release
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
-        TAG=${{ steps.get_version.outputs.version }}
+        # Prefer user-supplied tag from workflow input; otherwise auto-generate to avoid relying on pre-existing git tags
+        INPUT_TAG="${{ github.event.inputs.release_tag }}"
+        VERSION_TAG="${{ steps.get_version.outputs.version }}"
+        DATE_SUFFIX="${{ steps.get_date.outputs.date }}"
+        if [ -n "$INPUT_TAG" ]; then
+          TAG="$INPUT_TAG"
+        else
+          TAG="${VERSION_TAG}-${DATE_SUFFIX}"
+        fi
+
         REPO="${{ github.repository }}"
         API_GET="https://api.github.com/repos/$REPO/releases/tags/$TAG"
 
-        echo "Checking for existing release with tag $TAG"
+        echo "Using tag: $TAG"
+
+        # Check if a release with this tag already exists
         resp=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$API_GET" || true)
 
         if echo "$resp" | grep -q '"message": "Not Found"'; then
-          echo "Release not found — creating a new release"
+          echo "Release not found — creating a new release with tag $TAG"
           create_resp=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"$TAG\", \"name\": \"Release $TAG\", \"body\": \"Auto-generated release with multi-platform binaries.\", \"draft\": false, \"prerelease\": false}" \
+            -d "{\"tag_name\": \"$TAG\", \"target_commitish\": \"${{ github.sha }}\", \"name\": \"Release $TAG\", \"body\": \"Auto-generated release with multi-platform binaries.\", \"draft\": false, \"prerelease\": false}" \
             "https://api.github.com/repos/$REPO/releases")
           upload_url=$(echo "$create_resp" | jq -r .upload_url | sed 's/{?name,label}//')
           echo "Created release, upload_url=$upload_url"
