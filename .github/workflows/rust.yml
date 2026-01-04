@@ -334,32 +334,33 @@ jobs:
         echo "date=$DATE" >> $GITHUB_OUTPUT
         echo "Date: $DATE"
 
-    - name: Create Release
+    - name: Find or create Release
       id: create_release
-      uses: actions/create-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.get_version.outputs.version }}
-        release_name: Release ${{ steps.get_version.outputs.version }}
-        body: |
-          ## yp ${{ steps.get_version.outputs.version }}
-          
-          Auto-generated release with multi-platform binaries.
-          
-          **Built on:** ${{ steps.get_date.outputs.date }}
-          
-          ### Supported Platforms:
-          - Linux x86_64 (musl)
-          - Linux aarch64 (musl) 
-          - Linux loongarch64 (musl)
-          - Windows x86_64
-          - Windows aarch64
-          - macOS x86_64
-          - macOS aarch64 (Apple Silicon)
-          
-        draft: false
-        prerelease: false
+      run: |
+        set -euo pipefail
+        TAG=${{ steps.get_version.outputs.version }}
+        REPO="${{ github.repository }}"
+        API_GET="https://api.github.com/repos/$REPO/releases/tags/$TAG"
+
+        echo "Checking for existing release with tag $TAG"
+        resp=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$API_GET" || true)
+
+        if echo "$resp" | grep -q '"message": "Not Found"'; then
+          echo "Release not found — creating a new release"
+          create_resp=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"tag_name\": \"$TAG\", \"name\": \"Release $TAG\", \"body\": \"Auto-generated release with multi-platform binaries.\", \"draft\": false, \"prerelease\": false}" \
+            "https://api.github.com/repos/$REPO/releases")
+          upload_url=$(echo "$create_resp" | jq -r .upload_url | sed 's/{?name,label}//')
+          echo "Created release, upload_url=$upload_url"
+          echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
+        else
+          echo "Release exists — reusing"
+          upload_url=$(echo "$resp" | jq -r .upload_url | sed 's/{?name,label}//')
+          echo "Found release, upload_url=$upload_url"
+          echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
+        fi
 
     - name: Upload Linux x86_64 musl
       uses: actions/upload-release-asset@v1
