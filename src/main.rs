@@ -118,6 +118,7 @@ fn main() {
                     Path::new(path),
                     &excludes,
                     "",
+                    false,
                     sort_by_size,
                     recursive,
                 ) {
@@ -664,6 +665,7 @@ fn print_tree_dir(
     root: &Path,
     excludes: &[String],
     prefix: &str,
+    show_icon: bool,
     sort_by_size: bool,
     recursive: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -709,19 +711,30 @@ fn print_tree_dir(
     let total = items.len();
     for (i, (name, p, is_dir, sz)) in items.into_iter().enumerate() {
         let is_last = i + 1 == total;
-        let branch = if is_last { "└── " } else { "├── " };
+        let branch = if is_last { "└──" } else { "├──" };
         let icon = if is_dir { "📁" } else { "📄" };
         let size_str = format_size(sz);
+
         if is_dir {
-            println!(
-                "{}{} {} {} {}",
-                prefix,
-                branch,
-                icon,
-                name.blue().bold(),
-                size_str.cyan()
-            );
-        } else {
+            if show_icon {
+                println!(
+                    "{}{} {} {} {}",
+                    prefix,
+                    branch,
+                    icon,
+                    name.blue().bold(),
+                    size_str.cyan()
+                );
+            } else {
+                println!(
+                    "{}{} {} {}",
+                    prefix,
+                    branch,
+                    name.blue().bold(),
+                    size_str.cyan()
+                );
+            }
+        } else if show_icon {
             println!(
                 "{}{} {} {} {}",
                 prefix,
@@ -730,6 +743,8 @@ fn print_tree_dir(
                 name.white(),
                 size_str.cyan()
             );
+        } else {
+            println!("{}{} {} {}", prefix, branch, name.white(), size_str.cyan());
         }
 
         if recursive && is_dir {
@@ -739,7 +754,15 @@ fn print_tree_dir(
                 format!("{}│   ", prefix)
             };
             // 递归打印子目录
-            print_tree_dir(&p, root, excludes, &new_prefix, sort_by_size, recursive)?;
+            print_tree_dir(
+                &p,
+                root,
+                excludes,
+                &new_prefix,
+                show_icon,
+                sort_by_size,
+                recursive,
+            )?;
         }
     }
 
