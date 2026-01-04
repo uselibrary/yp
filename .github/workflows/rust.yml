@@ -397,7 +397,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-x86_64-pc-windows-msvc.exe.zip
+        asset_path: ./release-files/yp-x86_64-pc-windows-msvc.zip
         asset_name: yp-x86_64-pc-windows-msvc.zip
         asset_content_type: application/zip
 
@@ -407,7 +407,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-aarch64-pc-windows-msvc.exe.zip
+        asset_path: ./release-files/yp-aarch64-pc-windows-msvc.zip
         asset_name: yp-aarch64-pc-windows-msvc.zip
         asset_content_type: application/zip
 
