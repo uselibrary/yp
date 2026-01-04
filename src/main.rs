@@ -95,7 +95,7 @@ fn main() {
     let json_output = matches.get_flag("json");
     let show_chart = matches.get_flag("chart");
     let tree_mode = matches.get_flag("tree");
-    let recursive = matches.get_flag("recursive");
+    let recursive = matches.get_flag("recursive") || tree_mode; // tree 模式默认递归
     let summary_only = matches.get_flag("summary");
     let excludes: Vec<String> = matches
         .get_many::<String>("exclude")
@@ -713,15 +713,22 @@ fn print_tree_dir(
         let icon = if is_dir { "📁" } else { "📄" };
         let size_str = format_size(sz);
         if is_dir {
-            println!("{}{} {} {}", prefix, branch, icon, name.blue().bold());
-            println!("{}         {}", prefix, size_str.cyan());
-        } else {
             println!(
-                "{}{} {} {}",
+                "{}{} {} {} {}",
                 prefix,
                 branch,
                 icon,
-                format!("{} {}", name, size_str).white()
+                name.blue().bold(),
+                size_str.cyan()
+            );
+        } else {
+            println!(
+                "{}{} {} {} {}",
+                prefix,
+                branch,
+                icon,
+                name.white(),
+                size_str.cyan()
             );
         }
 
