@@ -88,6 +88,12 @@ yp -s
 # show ASCII bar chart (默认启用；传入 `-c` 将禁用图表)
 yp -c
 
+# tree-style hierarchical listing (like `tree`) — shows each file/dir with size
+yp -t
+
+# recursive tree (print tree for subdirectories)
+yp -r -t
+
 # combine options
 yp -p /home -s -c
 
@@ -130,6 +136,7 @@ yp -p /usr -r
 | `-s` | `--sort` | Sort entries by size (enabled by default; providing `-s` disables sorting) |
 | `-j` | `--json` | Output JSON; in recursive mode includes all nested entries |
 | `-c` | `--chart` | Show ASCII-art bar chart (enabled by default; providing `-c` disables chart) |
+| `-t` | `--tree` | Print a tree-style hierarchical view of files and directories with sizes (`-r` to recurse) |
 | `-r` | `--recursive` | Recurse into all subdirectories |
 | `-S` | `--summary` | Show only directories and total size. In JSON mode this adds `file_count` and `dir_count` fields. |
 | `-e` | `--exclude <PATTERN>` | Exclude specified files or folders (can be used multiple times, current directory only) |
