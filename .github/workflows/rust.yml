@@ -1,27 +1,35 @@
-name: Multi-Platform Build
+name: Build and Release
 
 on:
-  # 手动触发（支持可选的 release_tag）
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: 'Optional: release tag to use (e.g. v1.2.3). Leave empty to auto-generate.'
-        required: false
-        default: ''
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # 获取版本号
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+  # 多平台编译
   build:
-    name: Build for ${{ matrix.target }}
+    needs: version
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux targets
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
@@ -31,16 +39,12 @@ jobs:
           - target: loongarch64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
-          
-          # Windows targets
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             cross: false
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             cross: false
-          
-          # macOS targets
           - target: x86_64-apple-darwin
             os: macos-latest
             cross: false
@@ -49,422 +53,65 @@ jobs:
             cross: false
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - uses: actions/checkout@v4
 
-    - name: Install Rust with retry
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
-      env:
-        RUSTUP_IO_THREADS: "1"
-      continue-on-error: true
-      id: rust_install_attempt1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-    - name: Retry Rust installation if first attempt failed
-      if: steps.rust_install_attempt1.outcome == 'failure'
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
-      env:
-        RUSTUP_IO_THREADS: "1"
-        RUSTUP_MAX_RETRIES: "10"
-      continue-on-error: true
-      id: rust_install_attempt2
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-    - name: Final Rust installation attempt with manual setup (Unix)
-      if: steps.rust_install_attempt2.outcome == 'failure' && runner.os != 'Windows'
-      run: |
-        # 手动安装Rust，使用更稳定的方式
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-        source ~/.cargo/env
-        rustup target add ${{ matrix.target }}
-      env:
-        RUSTUP_IO_THREADS: "1"
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
 
-    - name: Final Rust installation attempt with manual setup (Windows)
-      if: steps.rust_install_attempt2.outcome == 'failure' && runner.os == 'Windows'
-      run: |
-        # Windows手动安装Rust
-        Invoke-WebRequest -Uri https://win.rustup.rs -OutFile rustup-init.exe
-        .\rustup-init.exe -y --default-toolchain stable
-        & "$env:USERPROFILE\.cargo\bin\rustup.exe" target add ${{ matrix.target }}
-      env:
-        RUSTUP_IO_THREADS: "1"
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
 
-    - name: Ensure Rust is in PATH (Unix)
-      if: runner.os != 'Windows'
-      run: |
-        source ~/.cargo/env || true
-        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../yp-${{ matrix.target }}.tar.gz yp
+          cd ../../..
 
-    - name: Ensure Rust is in PATH (Windows)
-      if: runner.os == 'Windows'
-      run: |
-        echo "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path yp.exe -DestinationPath ../../../yp-${{ matrix.target }}.zip
+          cd ../../..
 
-    - name: Verify Rust installation (Unix)
-      if: runner.os != 'Windows'
-      run: |
-        source ~/.cargo/env || true
-        rustc --version
-        cargo --version
-        rustup target list --installed
-        echo "Target ${{ matrix.target }} is available: $(rustup target list --installed | grep -q ${{ matrix.target }} && echo 'YES' || echo 'NO')"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yp-${{ matrix.target }}
+          path: yp-${{ matrix.target }}.*
 
-    - name: Verify Rust installation (Windows)
-      if: runner.os == 'Windows'
-      run: |
-        rustc --version
-        cargo --version
-        rustup target list --installed
-        if (rustup target list --installed | Select-String "${{ matrix.target }}") { 
-          Write-Host "Target ${{ matrix.target }} is available: YES" 
-        } else { 
-          Write-Host "Target ${{ matrix.target }} is available: NO" 
-        }
-
-    - name: Install musl-tools (Linux musl targets)
-      if: contains(matrix.target, 'linux-musl')
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y musl-tools musl-dev
-        # 为x86_64目标创建符号链接
-        if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-          sudo ln -sf /usr/bin/musl-gcc /usr/local/bin/x86_64-linux-musl-gcc || true
-        fi
-
-    - name: Install Windows ARM64 build tools
-      if: matrix.target == 'aarch64-pc-windows-msvc'
-      run: |
-        # 确保安装了正确的MSVC工具链
-        rustup target add aarch64-pc-windows-msvc
-
-    - name: Install cross-compilation tool with retry (Unix)
-      if: matrix.cross && runner.os != 'Windows'
-      run: |
-        source ~/.cargo/env || true
-        # 首次尝试安装cross
-        if ! cargo install cross --git https://github.com/cross-rs/cross; then
-          echo "First attempt failed, retrying..."
-          sleep 10
-          # 第二次尝试
-          if ! cargo install cross --git https://github.com/cross-rs/cross; then
-            echo "Second attempt failed, trying with different approach..."
-            sleep 10
-            # 第三次尝试，使用crates.io版本
-            cargo install cross
-          fi
-        fi
-        cross --version
-
-    - name: Install cross-compilation tool with retry (Windows)
-      if: matrix.cross && runner.os == 'Windows'
-      run: |
-        # 首次尝试安装cross
-        try {
-          cargo install cross --git https://github.com/cross-rs/cross
-        } catch {
-          Write-Host "First attempt failed, retrying..."
-          Start-Sleep 10
-          try {
-            cargo install cross --git https://github.com/cross-rs/cross
-          } catch {
-            Write-Host "Second attempt failed, trying with different approach..."
-            Start-Sleep 10
-            cargo install cross
-          }
-        }
-        cross --version
-
-    - name: Pre-build environment check (Unix)
-      if: runner.os != 'Windows'
-      run: |
-        source ~/.cargo/env || true
-        echo "=== Environment Check ==="
-        echo "Rust version: $(rustc --version)"
-        echo "Cargo version: $(cargo --version)"
-        echo "Target: ${{ matrix.target }}"
-        echo "Cross compilation: ${{ matrix.cross }}"
-        echo "Available targets:"
-        rustup target list --installed
-        if [[ "${{ matrix.cross }}" == "true" ]]; then
-          echo "Cross version: $(cross --version)"
-        fi
-        echo "========================="
-
-    - name: Pre-build environment check (Windows)
-      if: runner.os == 'Windows'
-      run: |
-        Write-Host "=== Environment Check ==="
-        Write-Host "Rust version: $(rustc --version)"
-        Write-Host "Cargo version: $(cargo --version)"
-        Write-Host "Target: ${{ matrix.target }}"
-        Write-Host "Cross compilation: ${{ matrix.cross }}"
-        Write-Host "Available targets:"
-        rustup target list --installed
-        if ("${{ matrix.cross }}" -eq "true") {
-          Write-Host "Cross version: $(cross --version)"
-        }
-        Write-Host "========================="
-
-    - name: Build with cargo (native - Unix)
-      if: matrix.cross == false && runner.os != 'Windows'
-      run: |
-        source ~/.cargo/env || true
-        cargo build --release --target ${{ matrix.target }} --verbose
-
-    - name: Build with cargo (native - Windows)
-      if: matrix.cross == false && runner.os == 'Windows'
-      run: |
-        cargo build --release --target ${{ matrix.target }} --verbose
-
-    - name: Build with cross (cross-compilation - Unix)
-      if: matrix.cross == true && runner.os != 'Windows'
-      run: |
-        source ~/.cargo/env || true
-        cross build --release --target ${{ matrix.target }} --verbose
-
-    - name: Build with cross (cross-compilation - Windows)
-      if: matrix.cross == true && runner.os == 'Windows'
-      run: |
-        cross build --release --target ${{ matrix.target }} --verbose
-
-    - name: Create artifact directory (Unix)
-      if: runner.os != 'Windows'
-      run: mkdir -p artifacts
-
-    - name: Create artifact directory (Windows)
-      if: runner.os == 'Windows'
-      run: New-Item -ItemType Directory -Force -Path artifacts
-
-    - name: Copy binary (Unix)
-      if: matrix.os != 'windows-latest'
-      run: cp target/${{ matrix.target }}/release/yp artifacts/yp-${{ matrix.target }}
-
-    - name: Copy binary (Windows)
-      if: matrix.os == 'windows-latest'
-      run: cp target/${{ matrix.target }}/release/yp.exe artifacts/yp-${{ matrix.target }}.exe
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: yp-${{ matrix.target }}
-        path: artifacts/*
-
-  # 自动发布到GitHub Release
+  # 发布
   release:
-    if: github.event_name == 'workflow_dispatch'
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: all-artifacts
+      - name: List artifacts
+        run: ls -la artifacts/
 
-    - name: Display structure of downloaded files
-      run: ls -la all-artifacts/
-
-    - name: Prepare release files
-      run: |
-        set -e
-        mkdir -p release-files
-        cd all-artifacts
-        
-        # 处理每个平台的二进制文件
-        for dir in */; do
-          # 清理目录名，去掉末尾斜杠和任何空白字符
-          dir_clean=$(echo "$dir" | tr -d '/' | tr -d '[:space:]')
-          echo "Processing directory: $dir_clean"
-          
-          # 从目录名提取target（目录名格式为 yp-<target>）
-          target_name="${dir_clean#yp-}"
-          echo "Target name: $target_name"
-          
-          cd "$dir"
-          for file in *; do
-            # 跳过非文件
-            [ -f "$file" ] || continue
-            
-            if [[ "$file" == *.exe ]]; then
-              # Windows 可执行文件
-              echo "Creating Windows archive for $target_name"
-              archive_name="yp-${target_name}.zip"
-              # 直接创建包含重命名后文件的zip
-              cp "$file" yp.exe
-              zip "../../release-files/${archive_name}" yp.exe
-              rm yp.exe
-              echo "Created: ${archive_name}"
-            else
-              # Unix 可执行文件
-              echo "Creating Unix archive for $target_name"
-              archive_name="yp-${target_name}.tar.gz"
-              # 创建临时目录来重命名文件
-              temp_dir="../../release-files/temp-${target_name}"
-              mkdir -p "$temp_dir"
-              cp "$file" "$temp_dir/yp"
-              chmod +x "$temp_dir/yp"
-              # 创建tar.gz
-              tar -czf "../../release-files/${archive_name}" -C "$temp_dir" yp
-              rm -rf "$temp_dir"
-              echo "Created: ${archive_name}"
-            fi
-          done
-          cd ..
-        done
-        
-        cd ../release-files
-        
-        # 显示最终的发布文件
-        echo ""
-        echo "=== Release files ==="
-        ls -la
-        
-        # 验证压缩包内容
-        echo ""
-        echo "=== Verifying archive contents ==="
-        for archive in *.tar.gz 2>/dev/null; do
-          [ -f "$archive" ] || continue
-          echo "Contents of $archive:"
-          tar -tzf "$archive"
-        done
-        for archive in *.zip 2>/dev/null; do
-          [ -f "$archive" ] || continue
-          echo "Contents of $archive:"
-          unzip -l "$archive"
-        done
-
-    - name: Get version from Cargo.toml
-      id: get_version
-      run: |
-        VERSION=$(grep '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-        echo "version=v$VERSION" >> $GITHUB_OUTPUT
-        echo "Version: v$VERSION"
-
-    - name: Get current date
-      id: get_date
-      run: |
-        DATE=$(date +'%Y%m%d_%H%M%S')
-        echo "date=$DATE" >> $GITHUB_OUTPUT
-        echo "Date: $DATE"
-
-    - name: Install jq (for JSON parsing)
-      run: |
-        sudo apt-get update && sudo apt-get install -y jq
-
-    - name: Find or create Release
-      id: create_release
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        set -euo pipefail
-        # Prefer user-supplied tag from workflow input; otherwise auto-generate to avoid relying on pre-existing git tags
-        INPUT_TAG="${{ github.event.inputs.release_tag }}"
-        VERSION_TAG="${{ steps.get_version.outputs.version }}"
-        DATE_SUFFIX="${{ steps.get_date.outputs.date }}"
-        if [ -n "$INPUT_TAG" ]; then
-          TAG="$INPUT_TAG"
-        else
-          TAG="${VERSION_TAG}-${DATE_SUFFIX}"
-        fi
-
-        REPO="${{ github.repository }}"
-        API_GET="https://api.github.com/repos/$REPO/releases/tags/$TAG"
-
-        echo "Using tag: $TAG"
-
-        # Check if a release with this tag already exists
-        resp=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$API_GET" || true)
-
-        if echo "$resp" | grep -q '"message": "Not Found"'; then
-          echo "Release not found — creating a new release with tag $TAG"
-          create_resp=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"$TAG\", \"target_commitish\": \"${{ github.sha }}\", \"name\": \"Release $TAG\", \"body\": \"Auto-generated release with multi-platform binaries.\", \"draft\": false, \"prerelease\": false}" \
-            "https://api.github.com/repos/$REPO/releases")
-          upload_url=$(echo "$create_resp" | jq -r .upload_url | sed 's/{?name,label}//')
-          echo "Created release, upload_url=$upload_url"
-          echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
-        else
-          echo "Release exists — reusing"
-          upload_url=$(echo "$resp" | jq -r .upload_url | sed 's/{?name,label}//')
-          echo "Found release, upload_url=$upload_url"
-          echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Upload Linux x86_64 musl
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-x86_64-unknown-linux-musl.tar.gz
-        asset_name: yp-x86_64-unknown-linux-musl.tar.gz
-        asset_content_type: application/gzip
-
-    - name: Upload Linux aarch64 musl
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-aarch64-unknown-linux-musl.tar.gz
-        asset_name: yp-aarch64-unknown-linux-musl.tar.gz
-        asset_content_type: application/gzip
-
-    - name: Upload Linux loongarch64 musl
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-loongarch64-unknown-linux-musl.tar.gz
-        asset_name: yp-loongarch64-unknown-linux-musl.tar.gz
-        asset_content_type: application/gzip
-
-    - name: Upload Windows x86_64
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-x86_64-pc-windows-msvc.zip
-        asset_name: yp-x86_64-pc-windows-msvc.zip
-        asset_content_type: application/zip
-
-    - name: Upload Windows aarch64
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-aarch64-pc-windows-msvc.zip
-        asset_name: yp-aarch64-pc-windows-msvc.zip
-        asset_content_type: application/zip
-
-    - name: Upload macOS x86_64
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-x86_64-apple-darwin.tar.gz
-        asset_name: yp-x86_64-apple-darwin.tar.gz
-        asset_content_type: application/gzip
-
-    - name: Upload macOS aarch64 (Apple Silicon)
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./release-files/yp-aarch64-apple-darwin.tar.gz
-        asset_name: yp-aarch64-apple-darwin.tar.gz
-        asset_content_type: application/gzip
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: Release v${{ needs.version.outputs.version }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
