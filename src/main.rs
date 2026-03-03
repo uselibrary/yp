@@ -3,25 +3,115 @@ use clap::{Arg, Command};
 use colored::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use terminal_size::{Width, terminal_size};
+use thiserror::Error;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const BAR_MAX_WIDTH: usize = 40;
+const WARN_LIMIT: usize = 20;
+
+/// 并行化阈值：目录项数量小于该值时走串行，避免递归 into_par_iter 造成任务膨胀。
+/// 这是经验值：IO 密集型遍历受磁盘带宽影响，合理阈值应通过 benchmark 决定。
+/// 允许用环境变量覆盖：YP_PAR_MIN_ENTRIES=256 ./yp ...
+fn par_min_entries() -> usize {
+    std::env::var("YP_PAR_MIN_ENTRIES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(64)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DirEntry {
+struct ScanEntry {
     name: String,
     size: u64,
     is_dir: bool,
-    path: String,
+    path: String, // JSON 输出友好；非 UTF-8 路径会 lossy，这里接受这一限制
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DirReport {
     total_size: u64,
-    entries: Vec<DirEntry>,
+    entries: Vec<ScanEntry>,
     path: String,
 }
+
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("路径不存在: {0}")]
+    PathNotFound(String),
+
+    #[error("无法读取目录: {path} ({source})")]
+    ReadDir {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("无法读取元数据: {path} ({source})")]
+    Metadata {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("JSON 序列化错误: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+type AppResult<T> = Result<T, AppError>;
+
+/// 控制告警输出，避免并行遍历时刷屏
+#[derive(Debug)]
+struct WarningTracker {
+    count: AtomicUsize,
+}
+
+impl WarningTracker {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    fn warn_io(&self, context: &str, path: &Path, err: &dyn std::fmt::Display) {
+        let n = self.count.fetch_add(1, Ordering::Relaxed);
+        if n < WARN_LIMIT {
+            eprintln!(
+                "{} {}: {} ({})",
+                "警告:".yellow().bold(),
+                context,
+                path.display(),
+                err
+            );
+            if n + 1 == WARN_LIMIT {
+                eprintln!(
+                    "{} 已达到告警上限（{} 条），后续错误将不再逐条打印。",
+                    "提示:".yellow().bold(),
+                    WARN_LIMIT
+                );
+            }
+        }
+    }
+
+    fn has_warnings(&self) -> bool {
+        self.count.load(Ordering::Relaxed) > 0
+    }
+
+    fn warning_count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+/// 目录大小 cache：
+/// - key 使用 PathBuf（来自实际遍历，不依赖 lossy 字符串），避免非 UTF-8 路径 miss
+/// - 用 Mutex 简化；tree 打印通常是串行递归，锁竞争很低
+type SizeCache = Mutex<HashMap<PathBuf, u64>>;
 
 fn main() {
     let matches = Command::new("yp")
@@ -37,12 +127,10 @@ fn main() {
                 .default_value("."),
         )
         .arg(
-            Arg::new("sort")
-                .short('s')
-                .long("sort")
-                .help("按大小从大到小排序显示（默认启用；使用该开关将禁用）")
-                .action(clap::ArgAction::SetFalse)
-                .default_value("true"),
+            Arg::new("no-sort")
+                .long("no-sort")
+                .help("禁用按大小排序（默认启用排序）")
+                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("json")
@@ -52,25 +140,29 @@ fn main() {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("chart")
-                .short('c')
-                .long("chart")
-                .help("显示 ASCII 条形图（默认启用；使用该开关将禁用）")
-                .action(clap::ArgAction::SetFalse)
-                .default_value("true"),
+            Arg::new("no-chart")
+                .long("no-chart")
+                .help("禁用 ASCII 条形图（默认启用）")
+                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("recursive")
                 .short('r')
                 .long("recursive")
-                .help("递归显示所有子目录（列出整棵子树）")
+                .help("递归显示所有子目录（tree 模式下表示展开所有层级）")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("tree")
                 .short('t')
                 .long("tree")
-                .help("以树状（tree）方式显示每个文件/目录及其大小（可与 -r 结合）")
+                .help("以树状（tree）方式显示每个文件/目录及其大小（默认只显示一层；与 -r 结合递归展开）")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("icon")
+                .long("icon")
+                .help("tree 模式显示图标（📁/📄）")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -85,48 +177,93 @@ fn main() {
                 .short('e')
                 .long("exclude")
                 .value_name("PATTERN")
-                .help("排除指定的文件或文件夹（可多次使用）")
+                .help("排除指定的文件或文件夹（可多次使用；支持名称或相对/绝对路径）")
                 .action(clap::ArgAction::Append),
         )
         .get_matches();
 
     let path = matches.get_one::<String>("path").unwrap();
-    let sort_by_size = matches.get_flag("sort");
+    let sort_by_size = !matches.get_flag("no-sort");
     let json_output = matches.get_flag("json");
-    let show_chart = matches.get_flag("chart");
+    let show_chart = !matches.get_flag("no-chart");
     let tree_mode = matches.get_flag("tree");
-    let recursive = matches.get_flag("recursive") || tree_mode; // tree 模式默认递归
+    let recursive = matches.get_flag("recursive");
+    let show_icon = matches.get_flag("icon");
     let summary_only = matches.get_flag("summary");
+
     let excludes: Vec<String> = matches
         .get_many::<String>("exclude")
         .map(|vals| vals.map(|s| s.to_string()).collect())
         .unwrap_or_default();
 
-    match analyze_directory(path, recursive, &excludes) {
+    let warnings = WarningTracker::new();
+
+    if tree_mode {
+        // tree 模式：不依赖 analyze_directory 产出 entries；目录大小由 cache 驱动
+        let root = Path::new(path);
+        if !root.exists() {
+            eprintln!(
+                "{} {}",
+                "错误:".red().bold(),
+                AppError::PathNotFound(root.display().to_string())
+            );
+            std::process::exit(1);
+        }
+
+        println!(
+            "{} {}",
+            "目录:".green().bold(),
+            root.display().to_string().yellow()
+        );
+
+        let cache: SizeCache = Mutex::new(HashMap::new());
+
+        // ✅ 关键修复：-t -r 时先预扫描整棵树，cache 命中率才有意义
+        let total_size = if recursive {
+            compute_dir_size_cached(root, root, &excludes, &warnings, &cache)
+        } else {
+            // 只显示一层时，总大小仍可给 root 子树大小（可选：也可只算一层）
+            compute_dir_size_cached(root, root, &excludes, &warnings, &cache)
+        };
+
+        println!(
+            "{} {}",
+            "总大小:".green().bold(),
+            format_size(total_size).cyan().bold()
+        );
+
+        // ✅ -t 默认只显示一层；-t -r 无限深度
+        let max_depth = if recursive { None } else { Some(1) };
+
+        if let Err(e) = print_tree_dir(
+            root,
+            root,
+            &excludes,
+            "",
+            show_icon,
+            sort_by_size,
+            max_depth,
+            0,
+            &cache,
+            &warnings,
+        ) {
+            eprintln!("{} 打印树状视图时出错: {}", "错误:".red().bold(), e);
+            std::process::exit(1);
+        }
+
+        if warnings.has_warnings() {
+            eprintln!(
+                "{} 本次扫描存在 {} 条访问/读取失败，输出结果可能偏小。",
+                "提示:".yellow().bold(),
+                warnings.warning_count()
+            );
+        }
+        return;
+    }
+
+    // 非 tree 模式：走 report 输出逻辑
+    match analyze_directory(path, recursive, &excludes, &warnings) {
         Ok(mut report) => {
-            if tree_mode {
-                // 打印树状结构。按是否递归决定是否进入子目录。
-                println!("{} {}", "目录:".green().bold(), report.path.yellow());
-                println!(
-                    "{} {}",
-                    "总大小:".green().bold(),
-                    format_size(report.total_size).cyan().bold()
-                );
-                // 以 root path 为起点，逐级打印
-                if let Err(e) = print_tree_dir(
-                    Path::new(path),
-                    Path::new(path),
-                    &excludes,
-                    "",
-                    false,
-                    sort_by_size,
-                    recursive,
-                ) {
-                    eprintln!("{} 打印树状视图时出错: {}", "错误:".red().bold(), e);
-                    std::process::exit(1);
-                }
-                return;
-            }
             if sort_by_size {
                 report
                     .entries
@@ -135,14 +272,26 @@ fn main() {
 
             if json_output {
                 if summary_only {
-                    output_json_summary(&report);
-                } else {
-                    output_json(&report);
+                    if let Err(e) = output_json_summary(&report) {
+                        eprintln!("{} {}", "错误:".red().bold(), e);
+                        std::process::exit(1);
+                    }
+                } else if let Err(e) = output_json(&report) {
+                    eprintln!("{} {}", "错误:".red().bold(), e);
+                    std::process::exit(1);
                 }
             } else if summary_only {
                 output_summary(&report);
             } else {
                 output_text(&report, show_chart);
+            }
+
+            if warnings.has_warnings() {
+                eprintln!(
+                    "{} 本次扫描存在 {} 条访问/读取失败，输出结果可能偏小。",
+                    "提示:".yellow().bold(),
+                    warnings.warning_count()
+                );
             }
         }
         Err(e) => {
@@ -153,9 +302,6 @@ fn main() {
 }
 
 /// 检查路径是否应该被排除
-/// current_path: 当前完整路径
-/// root_path: 根目录路径
-/// excludes: 排除模式列表（支持名称或路径）
 fn should_exclude(current_path: &Path, root_path: &Path, excludes: &[String]) -> bool {
     let name = current_path
         .file_name()
@@ -163,236 +309,281 @@ fn should_exclude(current_path: &Path, root_path: &Path, excludes: &[String]) ->
         .unwrap_or("");
 
     excludes.iter().any(|pattern| {
-        // 如果包含路径分隔符，按路径匹配
         if pattern.contains('/') || pattern.contains('\\') {
             let pattern_path = Path::new(pattern);
 
-            // 如果是绝对路径，直接比较
             if pattern_path.is_absolute() {
                 return current_path == pattern_path;
             }
 
-            // 否则按相对路径匹配
             if let Ok(relative) = current_path.strip_prefix(root_path) {
                 return relative == pattern_path;
             }
             false
         } else {
-            // 简单名称匹配
             name == pattern
         }
     })
 }
 
-/// 顶层分析入口：
-/// - 递归模式：一次并行遍历整棵子树，返回所有条目（含文件与目录），并聚合 total_size（仅文件之和）
-/// - 非递归模式：并行处理"直接子项"；
-///    - 文件：直接读取大小；
-///    - 目录：并行计算其子树大小，但不展开其子项到 entries（只返回该目录一条记录）。
+/// 抽取公共逻辑，串/并行分支都复用
+fn process_dir_entry(
+    entry: fs::DirEntry,
+    root: &Path,
+    excludes: &[String],
+    warnings: &WarningTracker,
+) -> Option<ScanEntry> {
+    let p = entry.path();
+    if should_exclude(&p, root, excludes) {
+        return None;
+    }
+
+    let name = entry.file_name().to_string_lossy().into_owned();
+
+    match entry.metadata() {
+        Ok(m) => {
+            if m.is_file() {
+                Some(ScanEntry {
+                    name,
+                    size: m.len(),
+                    is_dir: false,
+                    path: p.to_string_lossy().into_owned(),
+                })
+            } else if m.is_dir() {
+                let size = dir_size_mixed(&p, root, excludes, warnings);
+                Some(ScanEntry {
+                    name,
+                    size,
+                    is_dir: true,
+                    path: p.to_string_lossy().into_owned(),
+                })
+            } else {
+                None
+            }
+        }
+        Err(err) => {
+            warnings.warn_io("无法读取元数据", &p, &err);
+            None
+        }
+    }
+}
+
+/// 顶层分析入口（非 tree 模式）
 fn analyze_directory(
     path: &str,
     recursive: bool,
     excludes: &[String],
-) -> Result<DirReport, Box<dyn std::error::Error>> {
+    warnings: &WarningTracker,
+) -> AppResult<DirReport> {
     let root = Path::new(path);
     if !root.exists() {
-        return Err(format!("路径不存在: {}", root.display()).into());
+        return Err(AppError::PathNotFound(root.display().to_string()));
     }
+
     if !root.is_dir() {
-        // 与原语义保持一致：允许给文件路径，输出一个“父目录”的报告也不直观；
-        // 这里直接把该文件作为单条记录返回。
-        let meta = fs::metadata(root)?;
+        let meta = fs::metadata(root).map_err(|e| AppError::Metadata {
+            path: root.display().to_string(),
+            source: e,
+        })?;
         let size = meta.len();
-        let entry = DirEntry {
+        let entry = ScanEntry {
             name: root
                 .file_name()
-                .map(|s| s.to_string_lossy().to_string())
+                .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| root.display().to_string()),
             size,
             is_dir: false,
-            path: root.to_string_lossy().to_string(),
+            path: root.to_string_lossy().into_owned(),
         };
         return Ok(DirReport {
             total_size: size,
             entries: vec![entry],
-            path: root.to_string_lossy().to_string(),
+            path: root.to_string_lossy().into_owned(),
         });
     }
 
     if recursive {
-        // 并行递归：一次遍历，返回所有条目（不包含根目录本身）
-        let (_, entries) = scan_dir_recursive(root, root, excludes)?;
-        let total_size = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+        // ⚠️ &WarningTracker 可跨线程共享：
+        // WarningTracker 只包含 AtomicUsize（Sync），因此 &WarningTracker 可以被 rayon 闭包安全捕获。
+        let (_, entries) = scan_dir_recursive(root, root, excludes, warnings);
+        let total_size: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
         Ok(DirReport {
             total_size,
             entries,
-            path: root.to_string_lossy().to_string(),
+            path: root.to_string_lossy().into_owned(),
         })
     } else {
-        // 非递归：并行处理直接子项；目录大小为其整个子树大小，但不展开其子节点到 entries
-        let read_dir = fs::read_dir(root)?;
+        let read_dir = fs::read_dir(root).map_err(|e| AppError::ReadDir {
+            path: root.display().to_string(),
+            source: e,
+        })?;
         let items: Vec<_> = read_dir.collect();
-        let items: Vec<_> = items
-            .into_par_iter()
-            .filter_map(|res| res.ok())
-            .filter_map(|entry| {
-                let p = entry.path();
 
-                // 检查是否应该排除
-                if should_exclude(&p, root, excludes) {
-                    return None;
-                }
+        let threshold = par_min_entries();
 
-                let name = entry.file_name().to_string_lossy().to_string();
-
-                match entry.metadata() {
-                    Ok(m) => {
-                        if m.is_file() {
-                            let size = m.len();
-                            Some(DirEntry {
-                                name,
-                                size,
-                                is_dir: false,
-                                path: p.to_string_lossy().to_string(),
-                            })
-                        } else if m.is_dir() {
-                            // 计算该目录的整个子树大小（一次遍历该子树），但不展开
-                            match dir_size_parallel(&p, root, excludes) {
-                                Ok(size) => Some(DirEntry {
-                                    name,
-                                    size,
-                                    is_dir: true,
-                                    path: p.to_string_lossy().to_string(),
-                                }),
-                                Err(_) => None, // 跳过不可访问目录
-                            }
-                        } else {
-                            None
-                        }
+        let entries: Vec<ScanEntry> = if items.len() < threshold {
+            let mut out = Vec::new();
+            for res in items {
+                let entry = match res {
+                    Ok(v) => v,
+                    Err(err) => {
+                        warnings.warn_io("无法读取目录项", root, &err);
+                        continue;
                     }
-                    Err(_) => None, // 跳过无法读取元数据的条目
+                };
+                if let Some(se) = process_dir_entry(entry, root, excludes, warnings) {
+                    out.push(se);
                 }
-            })
-            .collect();
+            }
+            out
+        } else {
+            items
+                .into_par_iter()
+                .filter_map(|res| match res {
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        warnings.warn_io("无法读取目录项", root, &err);
+                        None
+                    }
+                })
+                .filter_map(|entry| process_dir_entry(entry, root, excludes, warnings))
+                .collect()
+        };
 
-        let total_size = items.iter().map(|e| e.size).sum();
+        let total_size: u64 = entries.iter().map(|e| e.size).sum();
         Ok(DirReport {
             total_size,
-            entries: items,
-            path: root.to_string_lossy().to_string(),
+            entries,
+            path: root.to_string_lossy().into_owned(),
         })
     }
 }
 
-/// 并行计算某目录子树的总文件大小（O(N) 一次遍历）。
-fn dir_size_parallel(
-    path: &Path,
-    root: &Path,
-    excludes: &[String],
-) -> Result<u64, Box<dyn std::error::Error>> {
+/// 计算某目录子树的总文件大小（串/并行混合）
+/// 遇到 IO 错误告警并按 0 继续
+fn dir_size_mixed(path: &Path, root: &Path, excludes: &[String], warnings: &WarningTracker) -> u64 {
     if !path.is_dir() {
-        let meta = fs::metadata(path)?;
-        return Ok(if meta.is_file() { meta.len() } else { 0 });
-    }
-
-    // 并行地遍历直接子项；对文件直接计入，对目录递归调用。
-    let read_dir = match fs::read_dir(path) {
-        Ok(rd) => rd,
-        Err(_) => return Ok(0), // 无权限等情况：按 0 处理
-    };
-    let entries: Vec<_> = read_dir.collect();
-
-    let sum = entries
-        .into_par_iter()
-        .filter_map(|e| e.ok())
-        .map(|entry| {
-            let p = entry.path();
-
-            // 检查是否应该排除
-            if should_exclude(&p, root, excludes) {
+        match fs::metadata(path) {
+            Ok(meta) => return if meta.is_file() { meta.len() } else { 0 },
+            Err(e) => {
+                warnings.warn_io("无法读取元数据", path, &e);
                 return 0;
             }
+        }
+    }
 
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            warnings.warn_io("无法读取目录", path, &e);
+            return 0;
+        }
+    };
+
+    let entries: Vec<_> = read_dir.collect();
+    let threshold = par_min_entries();
+
+    if entries.len() < threshold {
+        let mut sum = 0u64;
+        for res in entries {
+            let entry = match res {
+                Ok(v) => v,
+                Err(err) => {
+                    warnings.warn_io("无法读取目录项", path, &err);
+                    continue;
+                }
+            };
+            let p = entry.path();
+            if should_exclude(&p, root, excludes) {
+                continue;
+            }
             match entry.metadata() {
                 Ok(m) => {
                     if m.is_file() {
-                        m.len()
+                        sum += m.len();
                     } else if m.is_dir() {
-                        // 递归地并行求和
-                        dir_size_parallel(&p, root, excludes).unwrap_or(0)
-                    } else {
+                        sum += dir_size_mixed(&p, root, excludes, warnings);
+                    }
+                }
+                Err(err) => warnings.warn_io("无法读取元数据", &p, &err),
+            }
+        }
+        sum
+    } else {
+        entries
+            .into_par_iter()
+            .filter_map(|e| e.ok())
+            .map(|entry| {
+                let p = entry.path();
+                if should_exclude(&p, root, excludes) {
+                    return 0;
+                }
+                match entry.metadata() {
+                    Ok(m) => {
+                        if m.is_file() {
+                            m.len()
+                        } else if m.is_dir() {
+                            dir_size_mixed(&p, root, excludes, warnings)
+                        } else {
+                            0
+                        }
+                    }
+                    Err(err) => {
+                        warnings.warn_io("无法读取元数据", &p, &err);
                         0
                     }
                 }
-                Err(_) => 0,
-            }
-        })
-        .sum();
-
-    Ok(sum)
+            })
+            .sum()
+    }
 }
 
-/// 递归并行扫描子树，返回 (该子树文件总大小, 子树所有条目列表)。
-/// 返回的 entries **包含** 所有文件与目录条目（不包含 root 本身，以便顶层保持与旧行为一致）。
+/// 递归扫描子树（补齐阈值策略：小目录串行，大目录并行）
+/// 返回 (该子树文件总大小, 子树所有条目列表)
 fn scan_dir_recursive(
     path: &Path,
     root: &Path,
     excludes: &[String],
-) -> Result<(u64, Vec<DirEntry>), Box<dyn std::error::Error>> {
+    warnings: &WarningTracker,
+) -> (u64, Vec<ScanEntry>) {
     let read_dir = match fs::read_dir(path) {
         Ok(rd) => rd,
-        Err(_) => return Ok((0, Vec::new())), // 无权限：返回空
+        Err(e) => {
+            warnings.warn_io("无法读取目录", path, &e);
+            return (0, Vec::new());
+        }
     };
+
     let children: Vec<_> = read_dir.collect();
+    let threshold = par_min_entries();
 
-    // 用 rayon 对直接子项做并行处理；每个目录子项自身再并行递归。
-    let results: Vec<(u64, Vec<DirEntry>)> = children
-        .into_par_iter()
-        .filter_map(|res| res.ok())
-        .map(|entry| {
-            let p = entry.path();
-
-            // 检查是否应该排除
-            if should_exclude(&p, root, excludes) {
-                return (0, Vec::new());
-            }
-
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            match entry.metadata() {
-                Ok(m) => {
-                    if m.is_file() {
-                        let size = m.len();
-                        let me = DirEntry {
-                            name,
-                            size,
-                            is_dir: false,
-                            path: p.to_string_lossy().to_string(),
-                        };
-                        (size, vec![me])
-                    } else if m.is_dir() {
-                        // 递归：拿到子树大小与其条目，然后把"目录本身"也作为一条记录加入
-                        match scan_dir_recursive(&p, root, excludes) {
-                            Ok((sub_size, mut sub_entries)) => {
-                                let me = DirEntry {
-                                    name,
-                                    size: sub_size,
-                                    is_dir: true,
-                                    path: p.to_string_lossy().to_string(),
-                                };
-                                sub_entries.push(me);
-                                (sub_size, sub_entries)
-                            }
-                            Err(_) => (0, Vec::new()),
-                        }
-                    } else {
-                        (0, Vec::new())
-                    }
+    let results: Vec<(u64, Vec<ScanEntry>)> = if children.len() < threshold {
+        let mut out = Vec::new();
+        for res in children {
+            let entry = match res {
+                Ok(v) => v,
+                Err(err) => {
+                    warnings.warn_io("无法读取目录项", path, &err);
+                    continue;
                 }
-                Err(_) => (0, Vec::new()),
-            }
-        })
-        .collect();
+            };
+            out.push(scan_one_recursive(entry, root, excludes, warnings));
+        }
+        out
+    } else {
+        // ⚠️ &WarningTracker 可跨线程共享（见上面注释）
+        children
+            .into_par_iter()
+            .filter_map(|res| match res {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    warnings.warn_io("无法读取目录项", path, &err);
+                    None
+                }
+            })
+            .map(|entry| scan_one_recursive(entry, root, excludes, warnings))
+            .collect()
+    };
 
     let mut total = 0u64;
     let mut all_entries = Vec::new();
@@ -400,110 +591,204 @@ fn scan_dir_recursive(
         total += sz;
         all_entries.append(&mut list);
     }
-    Ok((total, all_entries))
+    (total, all_entries)
 }
 
-fn format_size(size: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = size as f64;
-    let mut unit_index = 0;
-
-    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_index += 1;
+fn scan_one_recursive(
+    entry: fs::DirEntry,
+    root: &Path,
+    excludes: &[String],
+    warnings: &WarningTracker,
+) -> (u64, Vec<ScanEntry>) {
+    let p = entry.path();
+    if should_exclude(&p, root, excludes) {
+        return (0, Vec::new());
     }
 
-    if unit_index == 0 {
-        format!("{} {}", size as u64, UNITS[unit_index])
-    } else {
-        format!("{:.2} {}", size, UNITS[unit_index])
-    }
-}
+    let name = entry.file_name().to_string_lossy().into_owned();
 
-/// 尽量保持和原逻辑一致的“中间省略”截断（仍基于 char/宽度，复杂 emoji 可能有边缘情况）
-fn truncate_filename(name: &str, max_width: usize) -> String {
-    let display_width = name.width();
-
-    if display_width <= max_width {
-        name.to_string()
-    } else if max_width <= 3 {
-        "...".to_string()
-    } else {
-        let mut result = String::new();
-        let chars: Vec<char> = name.chars().collect();
-        let available = max_width - 3;
-
-        if available >= 6 {
-            let start_chars = available / 2;
-            let end_chars = available - start_chars;
-
-            // 前半段
-            let mut current_width = 0;
-            let mut start_end = 0;
-            for (i, ch) in chars.iter().enumerate() {
-                let char_width = ch.width().unwrap_or(0);
-                if current_width + char_width > start_chars {
-                    break;
-                }
-                current_width += char_width;
-                start_end = i + 1;
+    match entry.metadata() {
+        Ok(m) => {
+            if m.is_file() {
+                let size = m.len();
+                let me = ScanEntry {
+                    name,
+                    size,
+                    is_dir: false,
+                    path: p.to_string_lossy().into_owned(),
+                };
+                (size, vec![me])
+            } else if m.is_dir() {
+                let (sub_size, mut sub_entries) = scan_dir_recursive(&p, root, excludes, warnings);
+                let me = ScanEntry {
+                    name,
+                    size: sub_size,
+                    is_dir: true,
+                    path: p.to_string_lossy().into_owned(),
+                };
+                sub_entries.push(me);
+                (sub_size, sub_entries)
+            } else {
+                (0, Vec::new())
             }
-            for &ch in &chars[..start_end] {
-                result.push(ch);
-            }
-            result.push_str("...");
-
-            // 后半段
-            if chars.len() > start_end {
-                let mut end_width = 0;
-                let mut end_start = chars.len();
-                for (i, ch) in chars.iter().enumerate().rev() {
-                    let char_width = ch.width().unwrap_or(0);
-                    if end_width + char_width > end_chars {
-                        break;
-                    }
-                    end_width += char_width;
-                    end_start = i;
-                }
-                for &ch in &chars[end_start..] {
-                    result.push(ch);
-                }
-            }
-        } else {
-            // 空间较小，只保留开头
-            let mut current_width = 0;
-            for ch in chars.iter() {
-                let char_width = ch.width().unwrap_or(0);
-                if current_width + char_width > available {
-                    break;
-                }
-                current_width += char_width;
-                result.push(*ch);
-            }
-            result.push_str("...");
         }
-
-        result
+        Err(e) => {
+            warnings.warn_io("无法读取元数据", &p, &e);
+            (0, Vec::new())
+        }
     }
+}
+
+/// ✅ 目录大小预扫描 + cache 填充：
+/// - 计算该目录子树大小
+/// - 将每个目录的大小写入 cache（key=PathBuf）
+/// - 遇到错误告警并按 0 继续
+fn compute_dir_size_cached(
+    path: &Path,
+    root: &Path,
+    excludes: &[String],
+    warnings: &WarningTracker,
+    cache: &SizeCache,
+) -> u64 {
+    // cache hit
+    if let Some(v) = cache.lock().unwrap().get(path).copied() {
+        return v;
+    }
+
+    if !path.is_dir() {
+        let sz = match fs::metadata(path) {
+            Ok(m) => {
+                if m.is_file() {
+                    m.len()
+                } else {
+                    0
+                }
+            }
+            Err(e) => {
+                warnings.warn_io("无法读取元数据", path, &e);
+                0
+            }
+        };
+        return sz;
+    }
+
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            warnings.warn_io("无法读取目录", path, &e);
+            // 写入 cache，避免反复告警/反复尝试
+            cache.lock().unwrap().insert(path.to_path_buf(), 0);
+            return 0;
+        }
+    };
+
+    let entries: Vec<_> = read_dir.collect();
+    let threshold = par_min_entries();
+
+    let sum: u64 = if entries.len() < threshold {
+        let mut acc = 0u64;
+        for res in entries {
+            let entry = match res {
+                Ok(v) => v,
+                Err(err) => {
+                    warnings.warn_io("无法读取目录项", path, &err);
+                    continue;
+                }
+            };
+            let p = entry.path();
+            if should_exclude(&p, root, excludes) {
+                continue;
+            }
+            match entry.metadata() {
+                Ok(m) => {
+                    if m.is_file() {
+                        acc += m.len();
+                    } else if m.is_dir() {
+                        acc += compute_dir_size_cached(&p, root, excludes, warnings, cache);
+                    }
+                }
+                Err(err) => warnings.warn_io("无法读取元数据", &p, &err),
+            }
+        }
+        acc
+    } else {
+        entries
+            .into_par_iter()
+            .filter_map(|r| r.ok())
+            .map(|entry| {
+                let p = entry.path();
+                if should_exclude(&p, root, excludes) {
+                    return 0;
+                }
+                match entry.metadata() {
+                    Ok(m) => {
+                        if m.is_file() {
+                            m.len()
+                        } else if m.is_dir() {
+                            compute_dir_size_cached(&p, root, excludes, warnings, cache)
+                        } else {
+                            0
+                        }
+                    }
+                    Err(err) => {
+                        warnings.warn_io("无法读取元数据", &p, &err);
+                        0
+                    }
+                }
+            })
+            .sum()
+    };
+
+    cache.lock().unwrap().insert(path.to_path_buf(), sum);
+    sum
+}
+
+/// ✅ 无 f64 精度损失的 1024 基单位格式化（两位小数）
+/// - unit=0：整数 B
+/// - unit>0：整数部分 + 小数部分（rem*100/divisor）
+fn format_size(size: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    if size < 1024 {
+        return format!("{} {}", size, UNITS[0]);
+    }
+
+    let mut unit = 0usize;
+    let mut divisor: u128 = 1;
+
+    // 找到最大 unit，使得 size/divisor >= 1 且 unit 不越界
+    for i in 1..UNITS.len() {
+        let next = divisor * 1024;
+        if (size as u128) < next {
+            break;
+        }
+        divisor = next;
+        unit = i;
+    }
+
+    let n = size as u128;
+    let int_part = n / divisor;
+    let rem = n % divisor;
+    let frac = (rem * 100) / divisor; // 两位小数
+
+    format!("{}.{} {}", int_part, format!("{:02}", frac), UNITS[unit])
 }
 
 fn get_terminal_width() -> usize {
     if let Some((Width(w), _)) = terminal_size() {
-        // 更好地利用宽度，上限放宽到 160
         (w as usize).clamp(60, 160)
     } else {
-        100 // 默认宽度
+        100
     }
 }
 
-fn output_json(report: &DirReport) {
-    match serde_json::to_string_pretty(report) {
-        Ok(json) => println!("{}", json),
-        Err(e) => eprintln!("JSON 序列化错误: {}", e),
-    }
+fn output_json(report: &DirReport) -> AppResult<()> {
+    let json = serde_json::to_string_pretty(report)?;
+    println!("{}", json);
+    Ok(())
 }
 
-fn output_json_summary(report: &DirReport) {
+fn output_json_summary(report: &DirReport) -> AppResult<()> {
     let (file_cnt, dir_cnt) = report.entries.iter().fold((0usize, 0usize), |(f, d), e| {
         if e.is_dir { (f, d + 1) } else { (f + 1, d) }
     });
@@ -516,10 +801,9 @@ fn output_json_summary(report: &DirReport) {
         "dir_count": dir_cnt
     });
 
-    match serde_json::to_string_pretty(&summary) {
-        Ok(json) => println!("{}", json),
-        Err(e) => eprintln!("JSON 序列化错误: {}", e),
-    }
+    let json = serde_json::to_string_pretty(&summary)?;
+    println!("{}", json);
+    Ok(())
 }
 
 fn output_summary(report: &DirReport) {
@@ -540,49 +824,83 @@ fn output_summary(report: &DirReport) {
     println!("{}", "═".repeat(display_width).cyan().bold());
 }
 
-// 去除 ANSI 颜色码（简易版，匹配 \x1b ... m）
+/// 用 strip-ansi-escapes：覆盖完整 ANSI escape
 fn strip_ansi_codes(text: &str) -> String {
-    let mut result = String::new();
-    let mut in_escape = false;
+    strip_ansi_escapes::strip_str(text)
+}
 
-    for ch in text.chars() {
-        if ch == '\x1b' {
-            in_escape = true;
-            continue;
+/// 按显示宽度截取前缀（不超过 limit）
+fn take_prefix_by_width(s: &str, limit: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > limit {
+            break;
         }
-        if in_escape {
-            if ch == 'm' {
-                in_escape = false;
-            }
-            continue;
+        w += cw;
+        out.push(ch);
+    }
+    out
+}
+
+/// 按显示宽度截取后缀（不超过 limit）
+fn take_suffix_by_width(s: &str, limit: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut w = 0usize;
+    let mut start = chars.len();
+    for (i, ch) in chars.iter().enumerate().rev() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > limit {
+            break;
         }
-        result.push(ch);
+        w += cw;
+        start = i;
+    }
+    chars[start..].iter().collect()
+}
+
+/// “中间省略”截断：严格基于显示宽度
+fn truncate_filename(name: &str, max_width: usize) -> String {
+    let display_width = name.width();
+    if display_width <= max_width {
+        return name.to_string();
+    }
+    if max_width <= 3 {
+        return "...".to_string();
     }
 
+    let available = max_width - 3;
+    if available < 2 {
+        return "...".to_string();
+    }
+
+    let left = available / 2;
+    let right = available - left;
+
+    let mut result = String::new();
+    result.push_str(&take_prefix_by_width(name, left));
+    result.push_str("...");
+    result.push_str(&take_suffix_by_width(name, right));
     result
 }
 
 fn output_text(report: &DirReport, show_chart: bool) {
     let display_width = get_terminal_width();
 
-    // 布局参数
     let size_width = 12;
-    let chart_width = if show_chart { 42 } else { 0 }; // [40 个块 + 两侧括号]
-    let icon_width = 3; // emoji + 空格
+    let chart_width = if show_chart { BAR_MAX_WIDTH + 2 } else { 0 };
+    let icon_width = 3;
     let spacing = 2;
 
-    // 计算合适的文件名宽度，避免过度宽泛
     let used_width = icon_width + size_width + chart_width + spacing * 2;
     let available_width = display_width.saturating_sub(used_width);
     let filename_width = if show_chart {
-        // 有图表时，文件名宽度适中
         available_width.clamp(20, 50)
     } else {
-        // 无图表时，文件名宽度可以稍大但不过度
         available_width.clamp(30, 80)
     };
 
-    // 计算实际使用的总宽度
     let actual_width = icon_width + filename_width + size_width + chart_width + spacing * 2;
 
     println!("{}", "═".repeat(actual_width).cyan().bold());
@@ -612,19 +930,19 @@ fn output_text(report: &DirReport, show_chart: bool) {
             truncated_name.white()
         };
 
-        // 以“去色后的可见宽度”计算填充
-        let actual_width = strip_ansi_codes(&truncated_name).width();
-        let padding_needed = filename_width.saturating_sub(actual_width);
+        let visible_width = strip_ansi_codes(&truncated_name).width();
+        let padding_needed = filename_width.saturating_sub(visible_width);
         let padding = " ".repeat(padding_needed);
 
         if show_chart {
-            let bar_length = if max_size > 0 {
-                ((entry.size as f64 / max_size as f64) * 40.0).round() as usize
+            let bar_len = if max_size > 0 {
+                ((entry.size as f64 / max_size as f64) * BAR_MAX_WIDTH as f64).round() as usize
             } else {
                 0
-            };
-            let bar_length = bar_length.min(40);
-            let bar = "█".repeat(bar_length);
+            }
+            .min(BAR_MAX_WIDTH);
+
+            let bar = "█".repeat(bar_len);
             let bar_colored = if entry.is_dir {
                 bar.blue()
             } else {
@@ -638,7 +956,7 @@ fn output_text(report: &DirReport, show_chart: bool) {
                 padding,
                 size_str.cyan(),
                 bar_colored,
-                " ".repeat(40 - bar_length)
+                " ".repeat(BAR_MAX_WIDTH - bar_len)
             );
         } else {
             println!(
@@ -660,6 +978,7 @@ fn output_text(report: &DirReport, show_chart: bool) {
 }
 
 /// 打印树状结构（类似 tree）
+/// max_depth: Some(n) 表示最多进入 n 层子目录（root 的直接子项深度=1）；None 表示无限深度
 fn print_tree_dir(
     path: &Path,
     root: &Path,
@@ -667,40 +986,62 @@ fn print_tree_dir(
     prefix: &str,
     show_icon: bool,
     sort_by_size: bool,
-    recursive: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    max_depth: Option<usize>,
+    depth: usize,
+    cache: &SizeCache,
+    warnings: &WarningTracker,
+) -> AppResult<()> {
+    if let Some(maxd) = max_depth {
+        if depth >= maxd {
+            return Ok(());
+        }
+    }
+
+    // ✅ 不再构造 AppError 又降级：直接 read_dir，失败告警后继续
     let read_dir = match fs::read_dir(path) {
         Ok(rd) => rd,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            warnings.warn_io("无法读取目录", path, &e);
+            return Ok(());
+        }
     };
 
-    // 收集子项并计算大小（对于目录使用 dir_size_parallel）
-    let mut items: Vec<(String, std::path::PathBuf, bool, u64)> = read_dir
-        .filter_map(|r| r.ok())
-        .filter_map(|entry| {
-            let p = entry.path();
-            if should_exclude(&p, root, excludes) {
-                return None;
+    let mut items: Vec<(String, PathBuf, bool, u64)> = Vec::new();
+
+    for res in read_dir {
+        let entry = match res {
+            Ok(v) => v,
+            Err(err) => {
+                warnings.warn_io("无法读取目录项", path, &err);
+                continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            match entry.metadata() {
-                Ok(m) => {
-                    if m.is_file() {
-                        Some((name, p, false, m.len()))
-                    } else if m.is_dir() {
-                        // 计算目录大小（可能开销较大）
-                        match dir_size_parallel(&p, root, excludes) {
-                            Ok(sz) => Some((name, p, true, sz)),
-                            Err(_) => Some((name, p, true, 0)),
+        };
+
+        let p = entry.path();
+        if should_exclude(&p, root, excludes) {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        match entry.metadata() {
+            Ok(m) => {
+                if m.is_file() {
+                    items.push((name, p, false, m.len()));
+                } else if m.is_dir() {
+                    // cache 命中则用；miss 则 lazy 计算并写入 cache（只算一次）
+                    let sz = {
+                        if let Some(v) = cache.lock().unwrap().get(&p).copied() {
+                            v
+                        } else {
+                            compute_dir_size_cached(&p, root, excludes, warnings, cache)
                         }
-                    } else {
-                        None
-                    }
+                    };
+                    items.push((name, p, true, sz));
                 }
-                Err(_) => None,
             }
-        })
-        .collect();
+            Err(err) => warnings.warn_io("无法读取元数据", &p, &err),
+        }
+    }
 
     if sort_by_size {
         items.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
@@ -715,8 +1056,8 @@ fn print_tree_dir(
         let icon = if is_dir { "📁" } else { "📄" };
         let size_str = format_size(sz);
 
-        if is_dir {
-            if show_icon {
+        if show_icon {
+            if is_dir {
                 println!(
                     "{}{} {} {} {}",
                     prefix,
@@ -727,33 +1068,33 @@ fn print_tree_dir(
                 );
             } else {
                 println!(
-                    "{}{} {} {}",
+                    "{}{} {} {} {}",
                     prefix,
                     branch,
-                    name.blue().bold(),
+                    icon,
+                    name.white(),
                     size_str.cyan()
                 );
             }
-        } else if show_icon {
+        } else if is_dir {
             println!(
-                "{}{} {} {} {}",
+                "{}{} {} {}",
                 prefix,
                 branch,
-                icon,
-                name.white(),
+                name.blue().bold(),
                 size_str.cyan()
             );
         } else {
             println!("{}{} {} {}", prefix, branch, name.white(), size_str.cyan());
         }
 
-        if recursive && is_dir {
+        if is_dir {
             let new_prefix = if is_last {
                 format!("{}    ", prefix)
             } else {
                 format!("{}│   ", prefix)
             };
-            // 递归打印子目录
+
             print_tree_dir(
                 &p,
                 root,
@@ -761,7 +1102,10 @@ fn print_tree_dir(
                 &new_prefix,
                 show_icon,
                 sort_by_size,
-                recursive,
+                max_depth,
+                depth + 1,
+                cache,
+                warnings,
             )?;
         }
     }
