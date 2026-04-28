@@ -1,9 +1,9 @@
 use clap::{Arg, Command};
 use colored::*;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -94,7 +94,8 @@ enum ExcludePattern {
 
 // ---- ExcludeSet ----
 //
-// [FIX-MAINT-6] 删除 has_abs 字段，改为方法，避免手动维护不同步。
+// [FIX-MAINT-6] 为了在 should_exclude 的热路径避免重复扫描 patterns，
+// 保留 `has_abs` 作为只读缓存字段（在构造时设定，之后不可变）。
 #[derive(Debug, Clone)]
 struct ExcludeSet {
     patterns: Vec<ExcludePattern>,
@@ -143,19 +144,94 @@ impl<'a> ScanContext<'a> {
 
 // ---- ScanEntry / DirReport ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct ScanEntry {
-    name: String,
+    name: OsString,
     size: u64,
     is_dir: bool,
-    path: String,
+    path: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// 自定义序列化/反序列化：将 OsString/PathBuf 在序列化时以 UTF-8 友好的字符串输出（使用 lossy 转换），
+// 反序列化时从字符串恢复为 OsString/PathBuf。
+impl serde::Serialize for ScanEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ScanEntry", 4)?;
+        s.serialize_field("name", &self.name.to_string_lossy())?;
+        s.serialize_field("size", &self.size)?;
+        s.serialize_field("is_dir", &self.is_dir)?;
+        s.serialize_field("path", &self.path.to_string_lossy())?;
+        s.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ScanEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Helper {
+            name: String,
+            size: u64,
+            is_dir: bool,
+            path: String,
+        }
+
+        let h = Helper::deserialize(deserializer)?;
+        Ok(ScanEntry {
+            name: OsString::from(h.name),
+            size: h.size,
+            is_dir: h.is_dir,
+            path: PathBuf::from(h.path),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct DirReport {
     total_size: u64,
     entries: Vec<ScanEntry>,
-    path: String,
+    path: PathBuf,
+}
+
+impl serde::Serialize for DirReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("DirReport", 3)?;
+        s.serialize_field("total_size", &self.total_size)?;
+        s.serialize_field("entries", &self.entries)?;
+        s.serialize_field("path", &self.path.to_string_lossy())?;
+        s.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DirReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Helper {
+            total_size: u64,
+            entries: Vec<ScanEntry>,
+            path: String,
+        }
+
+        let h = Helper::deserialize(deserializer)?;
+        Ok(DirReport {
+            total_size: h.total_size,
+            entries: h.entries,
+            path: PathBuf::from(h.path),
+        })
+    }
 }
 
 // ---- AppError ----
@@ -164,18 +240,18 @@ struct DirReport {
 #[derive(Debug, Error)]
 enum AppError {
     #[error("路径不存在: {0}")]
-    PathNotFound(String),
+    PathNotFound(PathBuf),
 
     #[error("无法读取目录: {path} ({source})")]
     ReadDir {
-        path: String,
+        path: PathBuf,
         #[source]
         source: io::Error,
     },
 
     #[error("无法读取元数据: {path} ({source})")]
     Metadata {
-        path: String,
+        path: PathBuf,
         #[source]
         source: io::Error,
     },
@@ -413,17 +489,17 @@ fn process_dir_entry(
     if should_exclude(&p, ctx) {
         return None;
     }
-    let name = entry.file_name().to_string_lossy().into_owned();
+    let name = entry.file_name();
 
     // 如果在非递归预扫描阶段已经收集到顶层条目的元信息，优先使用以避免重复的 syscalls
     if let Some(meta_map) = top_meta
         && let Some((is_dir, sz)) = meta_map.get(&p)
     {
         return Some(ScanEntry {
-            name,
+            name: name.clone(),
             size: *sz,
             is_dir: *is_dir,
-            path: p.to_string_lossy().into_owned(),
+            path: p.clone(),
         });
     }
 
@@ -438,10 +514,10 @@ fn process_dir_entry(
 
     if let Some(sz) = meta_leaf_size_nofollow(&meta) {
         return Some(ScanEntry {
-            name,
+            name: name.clone(),
             size: sz,
             is_dir: false,
-            path: p.to_string_lossy().into_owned(),
+            path: p.clone(),
         });
     }
 
@@ -458,7 +534,7 @@ fn process_dir_entry(
         name,
         size,
         is_dir: true,
-        path: p.to_string_lossy().into_owned(),
+        path: p,
     })
 }
 
@@ -475,15 +551,16 @@ fn analyze_directory(
 ) -> AppResult<DirReport> {
     let root = Path::new(path);
     let ctx = ScanContext::new(root, excludes, warnings);
+    let root_display = lossy_display(root);
 
     let meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(AppError::PathNotFound(root.display().to_string()));
+            return Err(AppError::PathNotFound(app_error_path(root)));
         }
         Err(e) => {
             return Err(AppError::Metadata {
-                path: root.display().to_string(),
+                path: app_error_path(root),
                 source: e,
             });
         }
@@ -493,13 +570,13 @@ fn analyze_directory(
     if let Some(sz) = meta_leaf_size_nofollow(&meta) {
         let name = root
             .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.display().to_string());
+            .map(|s| OsString::from(s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| OsString::from(root_display.clone().into_owned()));
         let entry = ScanEntry {
             name,
             size: sz,
             is_dir: false,
-            path: root.to_string_lossy().into_owned(),
+            path: root.to_path_buf(),
         };
         // 若用户对文件使用 --recursive，给出提示
         if recursive {
@@ -508,7 +585,7 @@ fn analyze_directory(
         return Ok(DirReport {
             total_size: sz,
             entries: vec![entry],
-            path: root.to_string_lossy().into_owned(),
+            path: root.to_path_buf(),
         });
     }
 
@@ -519,11 +596,11 @@ fn analyze_directory(
         Ok(DirReport {
             total_size,
             entries,
-            path: root.to_string_lossy().into_owned(),
+            path: root.to_path_buf(),
         })
     } else {
         let read_dir = fs::read_dir(root).map_err(|e| AppError::ReadDir {
-            path: root.display().to_string(),
+            path: app_error_path(root),
             source: e,
         })?;
 
@@ -598,7 +675,7 @@ fn analyze_directory(
         Ok(DirReport {
             total_size,
             entries,
-            path: root.to_string_lossy().into_owned(),
+            path: root.to_path_buf(),
         })
     }
 }
@@ -737,7 +814,7 @@ fn scan_one_recursive(entry: fs::DirEntry, ctx: &ScanContext) -> (u64, Vec<ScanE
         return (0, Vec::new());
     }
 
-    let name = entry.file_name().to_string_lossy().into_owned();
+    let name = entry.file_name();
 
     let m = match fs::symlink_metadata(&p) {
         Ok(m) => m,
@@ -749,10 +826,10 @@ fn scan_one_recursive(entry: fs::DirEntry, ctx: &ScanContext) -> (u64, Vec<ScanE
 
     if let Some(sz) = meta_leaf_size_nofollow(&m) {
         let me = ScanEntry {
-            name,
+            name: name.clone(),
             size: sz,
             is_dir: false,
-            path: p.to_string_lossy().into_owned(),
+            path: p.clone(),
         };
         return (sz, vec![me]);
     }
@@ -763,7 +840,7 @@ fn scan_one_recursive(entry: fs::DirEntry, ctx: &ScanContext) -> (u64, Vec<ScanE
         name,
         size: sub_size,
         is_dir: true,
-        path: p.to_string_lossy().into_owned(),
+        path: p,
     };
     sub_entries.push(me);
     (sub_size, sub_entries)
@@ -789,6 +866,17 @@ fn format_size(size: u64) -> String {
     }
 
     unreachable!("format_size: exhausted units for size={}", size)
+}
+
+fn lossy_display<T>(value: &T) -> Cow<'_, str>
+where
+    T: AsRef<OsStr> + ?Sized,
+{
+    value.as_ref().to_string_lossy()
+}
+
+fn app_error_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 fn prefix_end_by_width(s: &str, limit: usize) -> usize {
@@ -898,7 +986,7 @@ fn output_json_summary(report: &DirReport) -> AppResult<()> {
     });
 
     let summary = serde_json::json!({
-        "path": report.path,
+        "path": report.path.to_string_lossy(),
         "total_size": report.total_size,
         "item_count": report.entries.len(),
         "file_count": file_cnt,
@@ -912,7 +1000,11 @@ fn output_json_summary(report: &DirReport) -> AppResult<()> {
 fn output_summary(report: &DirReport) {
     let w = get_terminal_width();
     println!("{}", "═".repeat(w).cyan().bold());
-    println!("{} {}", "目录:".green().bold(), report.path.yellow());
+    println!(
+        "{} {}",
+        "目录:".green().bold(),
+        report.path.to_string_lossy().yellow()
+    );
     println!(
         "{} {}",
         "总大小:".green().bold(),
@@ -944,7 +1036,11 @@ fn output_text(report: &DirReport, show_chart: bool) {
     let actual_width = icon_width + filename_width + size_width + chart_width + spacing * 2;
 
     println!("{}", "═".repeat(actual_width).cyan().bold());
-    println!("{} {}", "目录:".green().bold(), report.path.yellow());
+    println!(
+        "{} {}",
+        "目录:".green().bold(),
+        report.path.to_string_lossy().yellow()
+    );
     println!(
         "{} {}",
         "总大小:".green().bold(),
@@ -964,7 +1060,8 @@ fn output_text(report: &DirReport, show_chart: bool) {
         let size_str = format_size(entry.size);
         let type_icon = if entry.is_dir { "📁" } else { "📄" };
 
-        let truncated_name = truncate_filename(&entry.name, filename_width);
+        let name_cow = entry.name.to_string_lossy();
+        let truncated_name = truncate_filename(&name_cow, filename_width);
         let colored_name = if entry.is_dir {
             truncated_name.blue().bold()
         } else {
@@ -1035,7 +1132,7 @@ struct TreePrintConfig<'a> {
 
 #[derive(Debug)]
 struct TreeItem {
-    name: String,
+    name: OsString,
     path: PathBuf,
     is_dir: bool,
     size: u64,
@@ -1051,15 +1148,16 @@ fn run_tree_mode(
 ) -> AppResult<()> {
     let root = Path::new(path);
     let ctx = ScanContext::new(root, excludes, warnings);
+    let root_display = lossy_display(root);
 
     let meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(AppError::PathNotFound(root.display().to_string()));
+            return Err(AppError::PathNotFound(app_error_path(root)));
         }
         Err(e) => {
             return Err(AppError::Metadata {
-                path: root.display().to_string(),
+                path: app_error_path(root),
                 source: e,
             });
         }
@@ -1070,12 +1168,12 @@ fn run_tree_mode(
         println!(
             "{} {}",
             "路径:".green().bold(),
-            root.display().to_string().yellow()
+            root_display.as_ref().yellow()
         );
         let name = root
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.display().to_string());
+            .unwrap_or_else(|| root_display.into_owned());
         let size_str = format_size(sz);
         if show_icon {
             println!("└── 📄 {} {}", name.white(), size_str.cyan());
@@ -1086,11 +1184,7 @@ fn run_tree_mode(
         return Ok(());
     }
 
-    println!(
-        "{} {}",
-        "目录:".green().bold(),
-        root.display().to_string().yellow()
-    );
+    println!("{} {}", "目录:".green().bold(), root_display.yellow());
 
     let max_depth = if recursive { None } else { Some(1) };
     let term_width = get_terminal_width();
@@ -1212,7 +1306,7 @@ fn print_tree_dir(
             continue;
         }
 
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = entry.file_name();
         let m = match fs::symlink_metadata(&p) {
             Ok(m) => m,
             Err(e) => {
@@ -1259,7 +1353,8 @@ fn print_tree_dir(
         fixed += 1 + size_str.width();
 
         let name_w = cfg.term_width.saturating_sub(fixed).clamp(4, 120);
-        let name_trunc = truncate_filename(&item.name, name_w);
+        let name_str = lossy_display(&item.name);
+        let name_trunc = truncate_filename(name_str.as_ref(), name_w);
         let pad = " ".repeat(name_w.saturating_sub(name_trunc.width()));
 
         let name_colored = if item.is_dir {
@@ -1437,7 +1532,7 @@ fn run() -> AppResult<()> {
 
     let excludes_raw: Vec<String> = matches
         .get_many::<String>("exclude")
-        .map(|vals| vals.map(|s| s.to_string()).collect())
+        .map(|vals| vals.cloned().collect())
         .unwrap_or_default();
     let excludes = compile_excludes(excludes_raw, &warnings);
 
