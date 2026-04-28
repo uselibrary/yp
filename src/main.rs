@@ -98,15 +98,15 @@ enum ExcludePattern {
 #[derive(Debug, Clone)]
 struct ExcludeSet {
     patterns: Vec<ExcludePattern>,
+    /// 缓存是否存在 Abs 模式，避免在热路径重复扫描 patterns。
+    has_abs: bool,
 }
 
 impl ExcludeSet {
     /// 是否存在 Abs 模式（用于 should_exclude 热路径决策是否执行 absify）
     #[inline]
     fn has_abs(&self) -> bool {
-        self.patterns
-            .iter()
-            .any(|p| matches!(p, ExcludePattern::Abs(_)))
+        self.has_abs
     }
 
     fn is_empty(&self) -> bool {
@@ -301,7 +301,8 @@ fn compile_excludes(raw: Vec<String>, warnings: &WarningTracker) -> ExcludeSet {
         }
     }
 
-    ExcludeSet { patterns }
+    let has_abs = patterns.iter().any(|p| matches!(p, ExcludePattern::Abs(_)));
+    ExcludeSet { patterns, has_abs }
 }
 
 // ---- should_exclude ----
@@ -406,13 +407,27 @@ fn process_dir_entry(
     entry: fs::DirEntry,
     ctx: &ScanContext,
     size_cache: Option<&HashMap<PathBuf, u64>>,
+    top_meta: Option<&HashMap<PathBuf, (bool, u64)>>,
 ) -> Option<ScanEntry> {
     let p = entry.path();
     if should_exclude(&p, ctx) {
         return None;
     }
-
     let name = entry.file_name().to_string_lossy().into_owned();
+
+    // 如果在非递归预扫描阶段已经收集到顶层条目的元信息，优先使用以避免重复的 syscalls
+    if let Some(meta_map) = top_meta
+        && let Some((is_dir, sz)) = meta_map.get(&p)
+    {
+        return Some(ScanEntry {
+            name,
+            size: *sz,
+            is_dir: *is_dir,
+            path: p.to_string_lossy().into_owned(),
+        });
+    }
+
+    // 否则回退到读取元数据
     let meta = match fs::symlink_metadata(&p) {
         Ok(m) => m,
         Err(e) => {
@@ -515,20 +530,32 @@ fn analyze_directory(
         let items: Vec<_> = read_dir.collect();
         let threshold = par_min_entries();
 
-        // 非 recursive：为每个子目录预先计算大小（串行，避免并行递归栈爆炸）
-        // 先串行扫描一遍拿到目录大小缓存，再并行/串行构建 ScanEntry
+        // 非 recursive：为每个顶层条目预先读取元信息并为目录计算大小（串行，避免并行递归栈爆炸）
+        // 先串行扫描一遍拿到目录大小缓存与顶层元信息，再并行/串行构建 ScanEntry，避免重复的 syscalls。
         let mut size_cache: HashMap<PathBuf, u64> = HashMap::new();
+        let mut top_meta: HashMap<PathBuf, (bool, u64)> = HashMap::new();
         for entry in items.iter().flatten() {
             let p = entry.path();
             if should_exclude(&p, &ctx) {
                 continue;
             }
-            if let Ok(m) = fs::symlink_metadata(&p)
-                && m.is_dir()
-            {
+
+            let m = match fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(e) => {
+                    warnings.warn_io(CTX_METADATA, &p, &e);
+                    continue;
+                }
+            };
+
+            if m.is_dir() {
                 let sz =
                     dir_size_recursive_serial(&p, &ctx, &mut size_cache, RecordMode::RecordNone);
-                size_cache.insert(p, sz);
+                size_cache.insert(p.clone(), sz);
+                top_meta.insert(p.clone(), (true, sz));
+            } else {
+                let sz = meta_leaf_size_nofollow(&m).unwrap_or(0);
+                top_meta.insert(p.clone(), (false, sz));
             }
         }
 
@@ -542,7 +569,8 @@ fn analyze_directory(
                         continue;
                     }
                 };
-                if let Some(se) = process_dir_entry(entry, &ctx, Some(&size_cache)) {
+                if let Some(se) = process_dir_entry(entry, &ctx, Some(&size_cache), Some(&top_meta))
+                {
                     out.push(se);
                 }
             }
@@ -558,13 +586,15 @@ fn analyze_directory(
                         None
                     }
                 })
-                .filter_map(|entry| process_dir_entry(entry, &ctx, Some(&size_cache)))
+                .filter_map(|entry| {
+                    process_dir_entry(entry, &ctx, Some(&size_cache), Some(&top_meta))
+                })
                 .collect()
         };
 
-        // [FIX-BUG-2] 非 recursive：total_size = 叶子文件大小之和
-        // 目录条目的 size 字段（子树大小）不重复累加
-        let total_size: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+        // 非 recursive：entries 仅包含根目录下一层条目，目录 size 是各自子树总和，
+        // 与同层文件大小互不重叠，因此直接累加全部条目可得到正确总大小。
+        let total_size: u64 = entries.iter().map(|e| e.size).sum();
         Ok(DirReport {
             total_size,
             entries,
@@ -1439,7 +1469,36 @@ fn run() -> AppResult<()> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(prefix: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("{}_{}_{}", prefix, pid, nanos));
+            fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     // [FIX-TEST-7] 使用可注入 cwd 的纯函数，不依赖全局 CWD
     #[test]
@@ -1450,6 +1509,7 @@ mod tests {
         let abs_pat = absify_for_compare_with_cwd(Path::new("foo/bar"), fake_cwd);
         let excludes = ExcludeSet {
             patterns: vec![ExcludePattern::Abs(abs_pat)],
+            has_abs: true,
         };
 
         // entry.path() 通常返回绝对路径
@@ -1486,6 +1546,7 @@ mod tests {
         // Name 模式下，has_abs() 返回 false，不触发 absify
         let excludes = ExcludeSet {
             patterns: vec![ExcludePattern::Name(OsString::from("node_modules"))],
+            has_abs: false,
         };
         assert!(!excludes.has_abs());
     }
@@ -1494,11 +1555,13 @@ mod tests {
     fn test_has_abs_derived_from_patterns() {
         let excludes_no_abs = ExcludeSet {
             patterns: vec![ExcludePattern::Name(OsString::from("foo"))],
+            has_abs: false,
         };
         assert!(!excludes_no_abs.has_abs());
 
         let excludes_with_abs = ExcludeSet {
             patterns: vec![ExcludePattern::Abs(PathBuf::from("/some/path"))],
+            has_abs: true,
         };
         assert!(excludes_with_abs.has_abs());
     }
@@ -1537,6 +1600,34 @@ mod tests {
         };
         output_text(&report, true);
         output_text(&report, false);
+    }
+
+    #[test]
+    fn test_non_recursive_total_size_includes_child_dirs() {
+        let tmp = TempDirGuard::new("yp_non_recursive_total_size");
+        let sub = tmp.path().join("sub");
+        fs::create_dir_all(&sub).expect("failed to create sub dir");
+        fs::write(sub.join("a.txt"), b"a").expect("failed to write a.txt");
+        fs::write(sub.join("b.txt"), b"bb").expect("failed to write b.txt");
+
+        let warnings = WarningTracker::new();
+        let excludes = ExcludeSet {
+            patterns: Vec::new(),
+            has_abs: false,
+        };
+
+        let report = analyze_directory(
+            tmp.path().to_str().expect("temp path is not valid UTF-8"),
+            false,
+            &excludes,
+            &warnings,
+        )
+        .expect("analyze_directory should succeed");
+
+        assert_eq!(report.total_size, 3, "非递归模式应统计子目录文件大小");
+        assert_eq!(report.entries.len(), 1, "顶层应只有一个子目录条目");
+        assert!(report.entries[0].is_dir, "顶层条目应为目录");
+        assert_eq!(report.entries[0].size, 3, "目录条目大小应为子树总和");
     }
 
     #[test]
